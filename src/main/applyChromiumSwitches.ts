@@ -3,6 +3,7 @@ import fs from "node:fs";
 import { BASE_DEFAULT_SETTINGS } from "Utils/Common/defaultSettings";
 
 import { logger } from "./Logger";
+import { type GpuFacts, hasNativeWebGpu, UNKNOWN_GPU } from "Utils/Main/nativeWebGpu";
 
 // Vulkan switches — both trigger Vulkan usage and are incompatible with ozone=wayland.
 const VULKAN_SWITCHES = ["use-vulkan", "enable-unsafe-webgpu", "enable-skia-graphite"];
@@ -18,11 +19,19 @@ export function hasNvidiaProprietaryDriver(
 }
 
 /**
- * Whether the settings ask for a mode that only works under X11 ozone: WebGPU shaders, or
- * the Vulkan renderer on an NVIDIA driver (see applyDefaultOptimizations for both).
+ * Whether the settings ask for a mode that only works under X11 ozone: WebGPU shaders on a
+ * GPU outside Chromium's Wayland allowlist, or the Vulkan renderer on an NVIDIA driver (see
+ * applyDefaultOptimizations for both).
  */
-function wantsX11(settings: Partial<Types.SettingsInterface["app"]>, nvidia: boolean): boolean {
-  return Boolean(settings?.enableWebGPU || (vulkanRendererEnabled(settings) && nvidia));
+function wantsX11(
+  settings: Partial<Types.SettingsInterface["app"]>,
+  nvidia: boolean,
+  gpu: GpuFacts = UNKNOWN_GPU,
+): boolean {
+  return Boolean(
+    (settings?.enableWebGPU && !hasNativeWebGpu(gpu)) ||
+      (vulkanRendererEnabled(settings) && nvidia),
+  );
 }
 
 // index.ts reads settings.json raw (no defaults merged), so a profile saved before this
@@ -54,6 +63,10 @@ export function restoreOriginalSessionEnv(env: NodeJS.ProcessEnv = process.env) 
  * index.ts).
  * Pure + env-injectable so the decision is unit-testable without spawning anything.
  *
+ * Not needed at all on a GPU Chromium already allowlists for WebGPU on Linux (NVIDIA
+ * 535.183.01+, see Utils/Main/nativeWebGpu): there the effects composite on native Wayland
+ * without any flag, so the app stays on Wayland and keeps fractional scaling.
+ *
  * Guards: FIGMA_FORCE_X11 prevents an infinite relaunch loop; dev is skipped (vite owns the
  * Electron process); test is skipped (Playwright drives the launched process directly, so
  * spawning a detached copy + app.exit(0) would orphan it and hang every e2e test); Flatpak is
@@ -67,9 +80,10 @@ export function shouldRelaunchUnderX11(
   settings: Partial<Types.SettingsInterface["app"]>,
   env: NodeJS.ProcessEnv = process.env,
   nvidia: boolean = hasNvidiaProprietaryDriver(),
+  gpu: GpuFacts = UNKNOWN_GPU,
 ): boolean {
   return Boolean(
-    wantsX11(settings, nvidia) &&
+    wantsX11(settings, nvidia, gpu) &&
       env.WAYLAND_DISPLAY &&
       !env.FIGMA_FORCE_X11 &&
       env.NODE_ENV !== "dev" &&
@@ -94,6 +108,7 @@ export function shouldRelaunchUnderX11(
 export function applyChromiumSwitches(
   settings: Partial<Types.SettingsInterface["app"]> = {},
   nvidia: boolean = hasNvidiaProprietaryDriver(),
+  gpu: GpuFacts = UNKNOWN_GPU,
 ) {
   // Chromium flags for better performance and GPU support
   // Full flags reference: https://peter.sh/experiments/chromium-command-line-switches/
@@ -111,7 +126,7 @@ export function applyChromiumSwitches(
   const userForcesVulkan = effectiveSwitches.some((s) => VULKAN_SWITCHES.includes(s.switch));
 
   // eslint-disable-next-line @typescript-eslint/no-use-before-define -- hoisted helper, kept below for readability
-  applyDefaultOptimizations(isWayland, userForcesVulkan, settings, nvidia);
+  applyDefaultOptimizations(isWayland, userForcesVulkan, settings, nvidia, gpu);
 
   if (effectiveSwitches.length) {
     for (const item of effectiveSwitches) {
@@ -136,6 +151,7 @@ function applyDefaultOptimizations(
   userForcesVulkan: boolean,
   settings: Partial<Types.SettingsInterface["app"]>,
   nvidia: boolean,
+  gpu: GpuFacts,
 ) {
   const enableShaders = !!settings.enableWebGPU;
   // Figma's Shader / Halftone / Noise effects need WebGPU output to composite onto the
@@ -174,7 +190,13 @@ function applyDefaultOptimizations(
       "Vulkan renderer requested but session is Wayland — using NVIDIA OpenGL (Flatpak and dev can't relaunch under XWayland)",
     );
   }
-  if (!shadersActive && enableShaders) {
+  if (!shadersActive && enableShaders && hasNativeWebGpu(gpu)) {
+    // Chromium's own allowlist covers this GPU: WebGPU and the GL interop are on by
+    // default under Wayland, no relaunch and no unsafe-webgpu switch required.
+    logger.info(
+      `WebGPU shaders enabled — NVIDIA driver ${gpu.nvidiaDriver} is on Chromium's WebGPU allowlist, staying on native Wayland`,
+    );
+  } else if (!shadersActive && enableShaders) {
     logger.info(
       process.env.FLATPAK_ID
         ? "WebGPU shaders requested but session is Wayland — running without them (not available under Flatpak: relaunching under XWayland crashes zypak's spawn interception, see applyChromiumSwitches.ts)"

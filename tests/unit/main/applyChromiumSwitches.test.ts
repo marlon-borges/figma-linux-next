@@ -114,6 +114,20 @@ describe("applyChromiumSwitches — Wayland vs X11 truth-table", () => {
     expect(has("ozone-platform")).toBe(false);
   });
 
+  test("Wayland + enableWebGPU on an allowlisted NVIDIA driver: stays native Wayland, no unsafe-webgpu", () => {
+    process.env.WAYLAND_DISPLAY = "wayland-0";
+
+    applyChromiumSwitches({ enableWebGPU: true }, false, { nvidiaDriver: "615.78.08" });
+
+    // Chromium turns WebGPU + GL interop on by itself for NVIDIA >= 535.183.01, so the
+    // Wayland defaults are kept exactly: no X11 platform, no blocklist bypass, no flag.
+    expect(switchValue("ozone-platform-hint")).toBe("auto");
+    expect(has("ozone-platform")).toBe(false);
+    expect(has("ignore-gpu-blocklist")).toBe(false);
+    expect(has("enable-unsafe-webgpu")).toBe(false);
+    expect(features()).toContain("WaylandWindowDecorations");
+  });
+
   test("Wayland + enableWebGPU: does NOT force ozone=x11 (shaders inactive on Wayland)", () => {
     process.env.WAYLAND_DISPLAY = "wayland-0";
 
@@ -211,6 +225,18 @@ describe("shouldRelaunchUnderX11", () => {
     expect(shouldRelaunchUnderX11(webgpu, { NODE_ENV: "production" }, false)).toBe(false);
   });
 
+  test("NVIDIA driver on Chromium's WebGPU allowlist → no relaunch (native Wayland works)", () => {
+    const env = { WAYLAND_DISPLAY: "wayland-0", NODE_ENV: "production" };
+    expect(shouldRelaunchUnderX11(webgpu, env, false, { nvidiaDriver: "615.78.08" })).toBe(false);
+    expect(shouldRelaunchUnderX11(webgpu, env, false, { nvidiaDriver: "535.183.01" })).toBe(false);
+  });
+
+  test("NVIDIA driver below the allowlist, or no NVIDIA at all → relaunch as before", () => {
+    const env = { WAYLAND_DISPLAY: "wayland-0", NODE_ENV: "production" };
+    expect(shouldRelaunchUnderX11(webgpu, env, false, { nvidiaDriver: "470.256.02" })).toBe(true);
+    expect(shouldRelaunchUnderX11(webgpu, env, false, { nvidiaDriver: null })).toBe(true);
+  });
+
   test("FLATPAK_ID set → no relaunch (regression: zypak spawn interception segfaults)", () => {
     expect(
       shouldRelaunchUnderX11(
@@ -290,6 +316,18 @@ describe("NVIDIA Vulkan renderer", () => {
     expect(shouldRelaunchUnderX11({ enableVulkanRenderer: true }, env, true)).toBe(true);
     expect(shouldRelaunchUnderX11({ enableVulkanRenderer: true }, env, false)).toBe(false);
     expect(shouldRelaunchUnderX11({ enableVulkanRenderer: false }, env, true)).toBe(false);
+  });
+
+  test("allowlisted NVIDIA driver keeps shaders on Wayland only while the Vulkan renderer is off", () => {
+    const env = { WAYLAND_DISPLAY: "wayland-0", NODE_ENV: "production" };
+    const gpu = { nvidiaDriver: "615.78.08" };
+    expect(
+      shouldRelaunchUnderX11({ enableWebGPU: true, enableVulkanRenderer: false }, env, true, gpu),
+    ).toBe(false);
+    // The Vulkan renderer still needs XWayland, whatever the WebGPU allowlist says.
+    expect(
+      shouldRelaunchUnderX11({ enableWebGPU: true, enableVulkanRenderer: true }, env, true, gpu),
+    ).toBe(true);
   });
 
   test("hasNvidiaProprietaryDriver checks /proc/driver/nvidia/version", () => {
