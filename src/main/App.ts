@@ -10,6 +10,7 @@ import { logger } from "./Logger";
 import { storage } from "./Storage";
 
 import type WindowManager from "./Ui/WindowManager";
+import Tab from "./Ui/Tab";
 import TrayManager from "./Ui/TrayManager";
 import type Session from "./Session";
 import type FontManager from "./Fonts";
@@ -105,7 +106,7 @@ export default class App {
         const tabId = win.getLatestFocusedTabId();
         if (!tabId) return null;
         const tab = win.tabs.get(tabId);
-        return tab?.view ?? null;
+        return tab instanceof Tab ? tab.view : null;
       },
       getActiveTabUrl: () => {
         const win = this.windowManager.getLastFocusedWindow();

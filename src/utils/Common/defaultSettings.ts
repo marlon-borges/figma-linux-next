@@ -46,6 +46,8 @@ export const BASE_DEFAULT_SETTINGS: Types.SettingsInterface = {
     hideWindowMinMaxButtons: false,
     newTabButtonAfterTabs: false,
     tabHoverPreviews: true,
+    lazyRestoreTabs: false,
+    lazyRestoreEagerCount: 3,
     allowDuplicateFileTabs: false,
     trayEnabled: false,
     figmaAgentEnabled: true,
