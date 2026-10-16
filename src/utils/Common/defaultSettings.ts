@@ -50,7 +50,7 @@ export const BASE_DEFAULT_SETTINGS: Types.SettingsInterface = {
     lazyRestoreEagerCount: 3,
     allowDuplicateFileTabs: false,
     trayEnabled: false,
-    figmaAgentEnabled: true,
+    figmaAgentEnabled: false,
     figmaTheme: "dark" as Types.FigmaThemePreference,
     lastSeenChangelogVersion: "",
   },
