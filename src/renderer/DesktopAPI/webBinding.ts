@@ -1,0 +1,579 @@
+import type { IpcRendererEvent } from "electron";
+import * as E from "electron";
+
+import { sendMsgToMain, registerCallbackWithMainProcess } from "Utils/Render/webBindingsHelpers";
+import { observeFigmaTheme } from "./themeObserver";
+import { normalizeTabPreviewData } from "Utils/Common/tabPreviewData";
+
+import {
+  isPrototypeUrl,
+  isValidFigjamLink,
+  isValidProjectLink,
+  normalizeEditorType,
+} from "Utils/Common";
+
+interface IntiApiOptions {
+  version: number;
+  appVersion: string;
+  fileBrowser: boolean;
+}
+
+const API_VERSION = 111;
+const APP_VERSION = "999.0.0";
+let webPort: MessagePort;
+const mainProcessCancelCallbacks: Map<number, () => void> = new Map();
+
+const onWebMessage = (event: MessageEvent) => {
+  const msg = event.data;
+
+  if (!msg) return;
+
+  if (msg.callbackID != null) {
+    const cancel = registerCallbackWithMainProcess(msg.name, msg.args, (args: any) => {
+      webPort.postMessage({ args, callbackID: msg.callbackID });
+    });
+    mainProcessCancelCallbacks.set(msg.callbackID, cancel);
+    return;
+  }
+  if (msg.cancelCallbackID != null) {
+    mainProcessCancelCallbacks.get(msg.cancelCallbackID)();
+    mainProcessCancelCallbacks.delete(msg.cancelCallbackID);
+    return;
+  }
+  // eslint-disable-next-line @typescript-eslint/no-use-before-define
+  if (!msg.name || !(msg.name in publicAPI)) {
+    sendMsgToMain("logWarn", "[desktop] Unhandled message", msg.name);
+    return;
+  }
+
+  let resultPromise: any;
+
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-use-before-define
+    resultPromise = msg.name && publicAPI?.[msg.name](msg.args);
+  } catch (e) {
+    console.error("onWebMessage, err: ", msg.name, e);
+    throw e;
+  } finally {
+    if (msg.promiseID != null) {
+      if (resultPromise instanceof Promise) {
+        resultPromise
+          .then((result) => {
+            webPort.postMessage({ result: result.data, promiseID: msg.promiseID });
+          })
+          .catch((error) => {
+            const errorString = error?.name || "Promise error";
+            webPort.postMessage({ error: errorString, promiseID: msg.promiseID });
+          });
+      } else {
+        webPort.postMessage({ error: `No result${resultPromise}`, promiseID: msg.promiseID });
+      }
+    }
+  }
+};
+
+const initWebApi = (props: IntiApiOptions) => {
+  const channel = new MessageChannel();
+  const pendingPromises = new Map();
+  const registeredCallbacks = new Map();
+
+  let messageHandler: (name: string, args: any) => void;
+  let nextPromiseID = 0;
+  let nextCallbackID = 0;
+
+  window.__figmaContent = false;
+
+  if (/file\/.+/.test(location.href)) {
+    props.fileBrowser = false;
+  }
+
+  window.__figmaDesktop = {
+    version: props.version,
+    appVersion: props.appVersion,
+    fileBrowser: props.fileBrowser,
+    postMessage: (name, args, transferList): void => {
+      if (import.meta.env.DEV) console.debug("[webBinding] postMessage:", name, args);
+      channel.port1.postMessage({ name, args }, transferList);
+    },
+    registerCallback: (name, args, callback) => {
+      const id = nextCallbackID++;
+      if (import.meta.env.DEV)
+        console.debug(`[webBinding] registerCallback id="${id}" name="${name}"`);
+      registeredCallbacks.set(id, callback);
+      channel.port1.postMessage({ name, args, callbackID: id });
+      return (): void => {
+        channel.port1.postMessage({ cancelCallbackID: id });
+      };
+    },
+    promiseMessage: (name, args, _transferList) =>
+      new Promise((resolve, reject) => {
+        const id = nextPromiseID++;
+        pendingPromises.set(id, { resolve, reject });
+        channel.port1.postMessage({ name, args, promiseID: id });
+      }),
+    setMessageHandler: (handler: (name: string, args: unknown) => void): void => {
+      messageHandler = handler;
+    },
+  };
+
+  channel.port1.onmessage = (event: MessageEvent): void => {
+    const msg = event.data;
+
+    if (!msg) return;
+
+    if (msg.promiseID != null) {
+      const pendingPromise = pendingPromises.get(msg.promiseID);
+
+      if (pendingPromise) {
+        pendingPromises.delete(msg.promiseID);
+        if ("result" in msg) {
+          pendingPromise.resolve(msg.result);
+        } else {
+          console.error(`Pending Promise (id: "${msg.promiseID}") reject via error: `, msg.error);
+          pendingPromise.reject(msg.error);
+        }
+      }
+    } else if (msg.callbackID != null) {
+      const registeredCallback = registeredCallbacks.get(msg.callbackID);
+      if (registeredCallback) {
+        registeredCallback(msg.args);
+      } else {
+        if (import.meta.env.DEV) console.warn("[webBinding] callback missing:", msg);
+      }
+    } else if (msg.name != null) {
+      messageHandler(msg.name, msg.args);
+    }
+  };
+
+  window.postMessage("init", location.origin, [channel.port2]);
+};
+
+const initWebBindings = (): void => {
+  // Multi-user auth completion: main process hands off the g_secret here,
+  // and we forward it through the page bridge so the in-page handler can
+  // finish the redeem with full session/CSRF context. The bridge target name
+  // is the channel the page listens on. When the bridge isn't ready yet
+  // (e.g., the login page hasn't established it), fall back to a top-level
+  // navigation so the server still mints a session.
+  E.ipcRenderer.on("figma:complete-auth", (_: IpcRendererEvent, gSecret: string, path?: string) => {
+    if (webPort) {
+      const args: { gSecret: string; path?: string } = { gSecret };
+      if (path) args.path = path;
+      webPort.postMessage({ name: "redeemAppAuth", args });
+    } else {
+      const url = `https://www.figma.com/app_auth/redeem?g_secret=${encodeURIComponent(gSecret)}`;
+      window.location.href = url;
+    }
+  });
+  E.ipcRenderer.on("newFile", () => {
+    webPort.postMessage({ name: "newFile", args: {} });
+  });
+  E.ipcRenderer.on("handleAction", (_: IpcRendererEvent, action: string, source: string) => {
+    webPort.postMessage({ name: "handleAction", args: { action, source } });
+  });
+  E.ipcRenderer.on("handleUrl", (_: IpcRendererEvent, path: string, params: string) => {
+    webPort.postMessage({ name: "handleUrl", args: { path, params } });
+  });
+  E.ipcRenderer.on("handleSetFullScreen", (_event: IpcRendererEvent, fullscreen: boolean) => {
+    webPort.postMessage({ name: "handleSetFullScreen", args: { fullscreen } });
+  });
+  E.ipcRenderer.on("showFlashMessage", (_event: IpcRendererEvent, flashErrorMessage: string) => {
+    webPort.postMessage({
+      name: "showFlashMessage",
+      args: { flashErrorMessage },
+    });
+  });
+  E.ipcRenderer.on("handlePageCommand", (_: IpcRendererEvent, command: string) => {
+    webPort.postMessage({
+      name: "handlePageCommand",
+      args: { pageCommand: command, source: "os-menu" },
+    });
+  });
+
+  E.ipcRenderer.on("handlePluginMenuAction", (_event: IpcRendererEvent, pluginMenuAction: any) => {
+    webPort.postMessage({ name: "handlePluginMenuAction", args: { pluginMenuAction } });
+  });
+};
+
+function keydownHandler(event: KeyboardEvent) {
+  const url = location.href;
+  if (
+    event.code === "F11" &&
+    (isValidProjectLink(url) || isValidFigjamLink(url) || isPrototypeUrl(url))
+  ) {
+    E.ipcRenderer.send("toggleCurrentWindowFullscreen");
+  }
+}
+
+const publicAPI: any = {
+  setTitle(args: WebApi.SetTitleArgs) {
+    sendMsgToMain("setTitle", args.title);
+  },
+
+  setUrl(args: any) {
+    const url = typeof args === "string" ? args : (args?.url ?? args?.href);
+    if (typeof url === "string" && url.length) sendMsgToMain("setTabUrl", url);
+  },
+
+  setUser(args: WebApi.SetUser) {
+    sendMsgToMain("setUser", args.id);
+  },
+  setUsingMicrophone(args: WebApi.SetUsingMic) {
+    sendMsgToMain("setUsingMicrophone", args.isUsingMicrophone);
+  },
+  setIsInVoiceCall(args: WebApi.SetIsInVoiceCall) {
+    sendMsgToMain("setIsInVoiceCall", args.isInVoiceCall);
+  },
+
+  addTabAnalyticsMetadata(args: any) {
+    // sendMsgToMain("addTabAnalyticsMetadata", args.isUsingMicrophone);
+    console.log("Method addTabAnalyticsMetadata not implemented, args: ", args);
+  },
+  async requestMicrophonePermission() {
+    let granted: boolean;
+
+    try {
+      await navigator.mediaDevices.getUserMedia({ video: false, audio: true });
+      granted = true;
+    } catch {
+      granted = false;
+    }
+
+    return { data: granted };
+  },
+  async setMediaEnabled(_args: any) {
+    return true;
+  },
+
+  newFile(args: any) {
+    sendMsgToMain("newFile", args.info);
+  },
+  // TODO: need update
+  openFile(args: any) {
+    sendMsgToMain("openFile", `/file/${args.fileKey}`, args.title, undefined, args.target);
+  },
+  openFileFromNewTab(args: any) {
+    if (args.url) {
+      const u = new URL(args.url);
+      sendMsgToMain("openFile", u.pathname + u.search, args.title, undefined, args.target ?? "tab");
+    } else {
+      sendMsgToMain(
+        "openFile",
+        `/file/${args.fileKey}`,
+        args.title,
+        undefined,
+        args.target ?? "tab",
+      );
+    }
+  },
+  openCommunity(args: WebApi.OpenCommunity) {
+    sendMsgToMain("openCommunity", args);
+  },
+  openPrototype(args: any) {
+    sendMsgToMain(
+      "openFile",
+      `/proto/${args.fileKey}`,
+      args.title,
+      `?node-id=${args.pageId}`,
+      args.target,
+    );
+  },
+
+  async createFile(args: WebApi.CreateFile) {
+    const result = await E.ipcRenderer.invoke("createFile", args);
+
+    return { data: result };
+  },
+  close(args: any) {
+    sendMsgToMain("closeTab", args.suppressReopening);
+  },
+  setLoading(args: WebApi.SetLoading) {
+    sendMsgToMain("setLoading", args);
+  },
+  setSaved(args: any) {
+    sendMsgToMain("updateSaveStatus", args.saved);
+  },
+  updateFullscreenMenuState(args: any) {
+    sendMsgToMain("updateFullscreenMenuState", args.state);
+  },
+  showFileBrowser() {
+    sendMsgToMain("showFileBrowser");
+  },
+  setIsPreloaded() {
+    sendMsgToMain("setIsPreloaded");
+  },
+  // Real-time collaboration — not applicable on Linux desktop
+  initLivegraph(_args: any) {},
+  // Figma sends `{ themePreference: "light" | "dark" | "system" }` — on startup
+  // and whenever the Theme menu changes. Older payload shapes are kept as fallbacks.
+  setThemePreference(args: any) {
+    const theme = args?.themePreference ?? args?.theme ?? args?.colorScheme ?? args;
+    sendMsgToMain("setFigmaTheme", theme);
+  },
+
+  // MCP integration — Figma web app notifies the desktop about MCP state.
+  setEnableMCP(args: any) {
+    if (import.meta.env.DEV) console.debug("[MCP] setEnableMCP:", JSON.stringify(args));
+    // Confirm server is running on the expected port so Figma activates the
+    // "Enable Desktop MCP server" button and starts sending sendMCPUpdate events.
+    return { data: { enabled: true, port: 3845 } };
+  },
+  sendMCPUpdate(args: any) {
+    if (import.meta.env.DEV) console.debug("[MCP] sendMCPUpdate:", JSON.stringify(args));
+    // Forward context updates to main process so McpServer can serve them.
+    // Known updateTypes: "tool_list" (tool list sync), future: "selection" (selected nodes).
+    sendMsgToMain("mcpContextUpdate", args);
+    return { data: null as null };
+  },
+
+  // Fire-and-forget messages that don't need main-process handling yet.
+  // In dev mode they log args so you can inspect the payload for future feature implementation.
+  setEditorType(args: any) {
+    if (import.meta.env.DEV) console.debug("[setEditorType]", args);
+    const raw = typeof args === "string" ? args : (args?.editorType ?? args?.type ?? args?.value);
+    if (typeof raw !== "string") return;
+    const normalized = normalizeEditorType(raw);
+    if (normalized) {
+      sendMsgToMain("setTabEditorType", normalized);
+    } else {
+      sendMsgToMain("logWarn", "[editor-type] unknown value from Figma:", raw);
+    }
+  },
+  setRealtimeToken(args: any) {
+    if (import.meta.env.DEV) console.debug("[stub] setRealtimeToken", args);
+  },
+  setLocales(args: any) {
+    if (import.meta.env.DEV) console.debug("[stub] setLocales", args);
+  },
+  setTabPreviewData(args: any) {
+    // Figma's own server thumbnail + last-edit time for this file tab; main
+    // stores it on the Tab and the hover card prefers it over a screenshot.
+    sendMsgToMain("setTabPreviewData", normalizeTabPreviewData(args));
+  },
+  setIsLibrary(args: any) {
+    if (import.meta.env.DEV) console.debug("[setIsLibrary]", args);
+    const isLibrary =
+      typeof args === "boolean" ? args : Boolean(args?.isLibrary ?? args?.is_library ?? args);
+    sendMsgToMain("setTabIsLibrary", isLibrary);
+  },
+  setIsTeamTemplate(args: any) {
+    if (import.meta.env.DEV) console.debug("[stub] setIsTeamTemplate", args);
+  },
+  updateColorProfile(args: any) {
+    if (import.meta.env.DEV) console.debug("[stub] updateColorProfile", args);
+  },
+  setEditFilePermissions(args: any) {
+    if (import.meta.env.DEV) console.debug("[stub] setEditFilePermissions", args);
+  },
+  updateViewport(args: any) {
+    if (import.meta.env.DEV) console.debug("[stub] updateViewport", args);
+  },
+  setTabColor(args: any) {
+    sendMsgToMain("setTabColor", args);
+  },
+
+  // Returns current screen(s) dimensions — used by Figma for modal/popup positioning
+  getActiveNSScreens() {
+    return Promise.resolve({
+      data: [
+        {
+          frame: { x: 0, y: 0, width: window.screen.width, height: window.screen.height },
+          visibleFrame: {
+            x: 0,
+            y: 0,
+            width: window.screen.availWidth,
+            height: window.screen.availHeight,
+          },
+          scaleFactor: window.devicePixelRatio ?? 1,
+        },
+      ],
+    });
+  },
+
+  // Returns keyboard layout type — used by Figma for shortcut key labels
+  getKeyboardLayout() {
+    return Promise.resolve({ data: "ANSI" });
+  },
+
+  // Returns available spell-check languages
+  spellingGetLanguages() {
+    return Promise.resolve({ data: [navigator.language] });
+  },
+  setInitialOptions(args: WebApi.SetInitOptions) {
+    sendMsgToMain("setInitialOptions", args);
+  },
+  setTheme(args: any) {
+    sendMsgToMain("setFigmaTheme", args?.themePreference ?? args?.theme ?? args);
+  },
+
+  setFeatureFlags(args: any) {
+    sendMsgToMain("setFeatureFlags", args);
+  },
+  startAppAuth(args: any) {
+    sendMsgToMain("startAppAuth", args);
+  },
+  finishAppAuth(args: any) {
+    sendMsgToMain("finishAppAuth", args);
+  },
+  openDevTools(args: { mode: string }) {
+    sendMsgToMain("openDevTools", args.mode);
+  },
+
+  setAuthedUsers(args: WebApi.SetAuthedUsers) {
+    sendMsgToMain("setAuthedUsers", args.userIDs);
+  },
+  setWorkspaceName(args: WebApi.SetWorkspaceName) {
+    sendMsgToMain("setWorkspaceName", args.name);
+  },
+  setFigjamEnabled(args: WebApi.SetFigjamEnabled) {
+    sendMsgToMain("setFigjamEnabled", args.figjamEnabled);
+  },
+  getZoomFactor() {
+    return Promise.resolve({ data: E.webFrame.getZoomFactor() });
+  },
+
+  // Messages newer Figma builds send that have no Linux counterpart. Answering
+  // them keeps the log readable: triggerHaptic alone logged thousands of
+  // "Unhandled message" warnings per session.
+  // Trackpad haptic feedback — macOS only.
+  triggerHaptic(_args: any) {},
+  // OS "increase contrast" hint — Figma's own accessibility setting covers it here.
+  setEnhancedContrast(_args: any) {},
+  // Custom spellcheck ignore list — Chromium's spellchecker keeps none for us.
+  spellingIgnoreWords(_args: any) {},
+  setIsBranch(args: any) {
+    if (import.meta.env.DEV) console.debug("[setIsBranch]", args);
+  },
+  updateCachedContainsWidget(args: any) {
+    if (import.meta.env.DEV) console.debug("[updateCachedContainsWidget]", args);
+  },
+  // OS live-captions preference — none on Linux. This one is a query: left
+  // unhandled, the web app's promise never settled.
+  getCaptionsEnabled() {
+    return Promise.resolve({ data: false });
+  },
+
+  async writeNewExtensionDirectoryToDisk(args: WebApi.WriteNewExtensionDirectoryToDisk) {
+    const data = await E.ipcRenderer.invoke("writeNewExtensionDirectoryToDisk", args);
+
+    return { data };
+  },
+  async getLocalManifestFileExtensionIdsToCachedMetadataMap() {
+    const data = await E.ipcRenderer.invoke("getLocalManifestFileExtensionIdsToCachedMetadataMap");
+
+    return { data };
+  },
+
+  async createMultipleNewLocalFileExtensions(args: WebApi.CreateMultipleExtension) {
+    const result = await E.ipcRenderer.invoke("createMultipleNewLocalFileExtensions", args);
+
+    return { data: result };
+  },
+  async getAllLocalManifestFileExtensionIds() {
+    const result = await E.ipcRenderer.invoke("getAllLocalFileExtensionIds");
+    return { data: result };
+  },
+  async getLocalFileExtensionManifest(args: WebApi.ExtensionId) {
+    const manifest = await E.ipcRenderer.invoke("getLocalFileExtensionManifest", args);
+    return { data: manifest };
+  },
+  async getLocalFileExtensionSource(args: WebApi.ExtensionId) {
+    const source = await E.ipcRenderer.invoke("getLocalFileExtensionSource", args);
+    return { data: source };
+  },
+  removeLocalFileExtension(args: WebApi.ExtensionId) {
+    E.ipcRenderer.send("removeLocalFileExtension", args);
+  },
+  openExtensionDirectory(args: WebApi.ExtensionId) {
+    E.ipcRenderer.send("openExtensionDirectory", args);
+  },
+  openExtensionManifest(args: WebApi.ExtensionId) {
+    E.ipcRenderer.send("openExtensionDirectory", args);
+  },
+  async writeNewExtensionToDisk(args: WebApi.WriteNewExtensionToDiskArgs) {
+    const extId = await E.ipcRenderer.invoke("writeNewExtensionToDisk", args);
+    return { data: extId };
+  },
+
+  async isDevToolsOpened() {
+    const isOpened = await E.ipcRenderer.invoke("isDevToolsOpened");
+
+    return { data: isOpened };
+  },
+
+  async getFonts(_args: WebApi.GetFonts) {
+    const fonts = await E.ipcRenderer.invoke("getFonts");
+    return { data: fonts };
+  },
+
+  async getModifiedFonts(_args: WebApi.GetFonts) {
+    const fonts = await E.ipcRenderer.invoke("getFonts");
+    return { data: fonts };
+  },
+
+  async getFontsModifiedAt(_args: WebApi.GetFonts) {
+    const fonts = await E.ipcRenderer.invoke("getFonts");
+    return { data: fonts };
+  },
+
+  async getFontFile(args: WebApi.GetFontFile) {
+    const fontBuffer = await E.ipcRenderer.invoke("getFontFile", args);
+
+    return { data: fontBuffer, transferList: [fontBuffer] };
+  },
+
+  // Electron 44 removed `clipboard` from renderers; main reads it (ClipboardController)
+  // and returns the first format that has data, in Figma's requested order.
+  async getClipboardData(args: any) {
+    const formats: string[] = args.getArray("formats");
+    const result: { data: ArrayBuffer; format: string } | null = await E.ipcRenderer.invoke(
+      "getClipboardData",
+      formats,
+    );
+
+    if (!result) {
+      sendMsgToMain("logError", "Formats not found. Formats: ", formats);
+      throw new Error("Formats not found");
+    }
+
+    return { data: result, transferList: [result.data] };
+  },
+
+  setClipboardData(args: WebApi.SetClipboardData) {
+    E.ipcRenderer.send("setClipboardData", args);
+  },
+
+  async writeFiles(args: WebApi.WriteFiles) {
+    await E.ipcRenderer.invoke("writeFiles", args);
+  },
+};
+
+const init = (fileBrowser: boolean): void => {
+  window.addEventListener(
+    "message",
+    (event) => {
+      if (event.data !== "init" || !event.ports || !event.ports.length) {
+        return;
+      }
+
+      webPort = event.ports[0];
+      webPort.onmessage = onWebMessage;
+    },
+    { once: true },
+  );
+
+  const initWebOptions: IntiApiOptions = {
+    version: API_VERSION,
+    appVersion: APP_VERSION,
+    fileBrowser: fileBrowser,
+  };
+
+  initWebBindings();
+  observeFigmaTheme();
+
+  E.webFrame.executeJavaScript(`(${initWebApi.toString()})(${JSON.stringify(initWebOptions)})`);
+
+  document.addEventListener("keydown", keydownHandler);
+};
+
+export default init;

@@ -1,0 +1,10 @@
+[Desktop Entry]
+Name=Figma Linux Next
+Comment=Unofficial desktop application for linux
+Exec=figma-linux-next %U
+Terminal=false
+Type=Application
+Icon=figma-linux-next
+StartupWMClass=figma-linux-next
+Categories=Graphics;
+MimeType=application/figma;x-scheme-handler/figma;

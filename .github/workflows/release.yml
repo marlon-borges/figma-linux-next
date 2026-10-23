@@ -1,0 +1,412 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*.*.*']
+
+jobs:
+  # Build deb, rpm, AppImage, zip for x64
+  build-x64:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - uses: oven-sh/setup-bun@v2
+
+      - name: Install system deps
+        run: sudo apt-get install -y rpm fakeroot
+
+      - name: Install dependencies
+        run: bun install
+
+      - name: Build app
+        run: bun run build
+
+      - name: Package (deb, rpm, AppImage, zip — x64)
+        run: bunx electron-builder --config=config/builder.json --publish never -l deb rpm AppImage zip --x64
+
+      - name: Generate release notes from CHANGELOG
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          VERSION_ESCAPED=$(printf '%s' "$VERSION" | sed 's/\./\\./g')
+          awk "/^## \[$VERSION_ESCAPED\]/{found=1; next} found && /^## \[/{exit} found{print}" CHANGELOG.md \
+            | sed '/^[[:space:]]*$/d' | sed '1{/^---/d}' > release_notes
+          echo "--- release_notes preview ---"
+          cat release_notes
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: installers-x64
+          path: build/installers/figma-linux-next_*
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: release-notes
+          path: release_notes
+
+  # Build deb, rpm, AppImage, zip for arm64 on native ARM runner
+  build-arm64:
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - uses: oven-sh/setup-bun@v2
+
+      - name: Install system deps
+        run: sudo apt-get install -y rpm fakeroot
+
+      - name: Install dependencies
+        run: bun install
+
+      - name: Build app
+        run: bun run build
+
+      - name: Package (deb, rpm, AppImage, zip — arm64)
+        run: bunx electron-builder --config=config/builder.json --publish never -l deb rpm AppImage zip --arm64
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: installers-arm64
+          path: build/installers/figma-linux-next_*
+
+  # Build pacman package on Arch Linux (x64 only, needs makepkg)
+  build-pacman:
+    runs-on: ubuntu-latest
+    container:
+      image: archlinux:latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Install deps
+        run: pacman -Sy --noconfirm bun nodejs npm base-devel fakeroot libxcrypt-compat
+
+      - name: Install dependencies
+        run: bun install
+
+      - name: Build app
+        run: bun run build
+
+      - name: Package (pacman)
+        run: bunx electron-builder --config=config/builder.json --publish never -l pacman
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: installer-pacman
+          path: build/installers/figma-linux-next_*_linux_x64.pacman
+
+  # x64 only — the manifest hardcodes the x64 Electron zip, and adding arm64 means
+  # vendoring a second binary and branching the unzip step.
+  #
+  # continue-on-error so a Flatpak failure costs the release only its .flatpak:
+  # deb/rpm/pacman/AppImage/zip still publish, and `release` still runs.
+  build-flatpak:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    container:
+      image: ghcr.io/flathub-infra/flatpak-github-actions:freedesktop-25.08
+      options: --privileged
+    steps:
+      - uses: actions/checkout@v5
+
+      # The manifest builds the released tag, so this checkout supplies only the
+      # manifest and the vendored sources — hence no bun/npm setup here.
+      - name: Install manifest dependencies
+        run: |
+          flatpak remote-add --if-not-exists --user flathub \
+            https://dl.flathub.org/repo/flathub.flatpakrepo
+          flatpak install -y --user --noninteractive flathub \
+            org.freedesktop.Sdk.Extension.node22//25.08 \
+            org.electronjs.Electron2.BaseApp//25.08
+
+      - uses: flatpak/flatpak-github-actions/flatpak-builder@v6
+        with:
+          bundle: figma-linux-next.flatpak
+          manifest-path: flatpak/app.borys.FigmaLinuxNext.yml
+          cache-key: flatpak-builder-${{ github.sha }}
+
+      - name: Name it like the other installers
+        run: mv figma-linux-next.flatpak "figma-linux-next_${GITHUB_REF_NAME#v}_linux_x64.flatpak"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: installer-flatpak
+          path: figma-linux-next_*_linux_x64.flatpak
+
+  # Create GitHub Release with all artifacts
+  release:
+    needs: [build-x64, build-arm64, build-pacman, build-flatpak]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v7
+        with:
+          pattern: 'installers-*'
+          merge-multiple: true
+          path: ./artifacts
+
+      - uses: actions/download-artifact@v7
+        with:
+          name: installer-pacman
+          path: ./artifacts
+
+      # Absent when build-flatpak failed; the release goes out without it.
+      - uses: actions/download-artifact@v7
+        continue-on-error: true
+        with:
+          name: installer-flatpak
+          path: ./artifacts
+
+      - uses: actions/download-artifact@v7
+        with:
+          name: release-notes
+          path: ./
+
+      - name: Compute SHA256SUMS
+        working-directory: ./artifacts
+        run: sha256sum figma-linux-next_* > SHA256SUMS
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          body_path: ./release_notes
+          name: figma-linux-next ${{ github.ref_name }}
+          prerelease: ${{ contains(github.ref_name, '-rc') || contains(github.ref_name, '-alpha') || contains(github.ref_name, '-beta') }}
+          files: |
+            ./artifacts/figma-linux-next_*
+            ./artifacts/SHA256SUMS
+
+  # Publish the .flatpak into a signed OSTree repository on GitHub Pages so
+  # Flatpak installs update through `flatpak update` / GNOME Software / Discover
+  # instead of a manual bundle download (#52).
+  #
+  # The site is rebuilt from scratch on every release: the previous repo state
+  # is pulled back from the live Pages URL (depth 1), the new bundle imported on
+  # top, static deltas generated, and everything older than one release pruned
+  # so the site stays well under the Pages 1 GB limit. First run finds no repo
+  # and just starts one. Nothing here touches git branches.
+  # Opt-in: runs only when the repository variable PUBLISH_FLATPAK_REPO is "true"
+  # (needs GitHub Pages in workflow mode and a FLATPAK_GPG_KEY secret of your own;
+  # replace flatpak/figma-linux-next-repo.gpg with its public half).
+  flatpak-repo:
+    needs: release
+    if: ${{ vars.PUBLISH_FLATPAK_REPO == 'true' && !contains(github.ref_name, '-rc') && !contains(github.ref_name, '-alpha') && !contains(github.ref_name, '-beta') }}
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    env:
+      APP_ID: app.borys.FigmaLinuxNext
+      SITE_URL: https://marlon-borges.github.io/figma-linux-next
+    steps:
+      - uses: actions/checkout@v5
+
+      # Absent when build-flatpak failed; then there is nothing to publish.
+      - uses: actions/download-artifact@v7
+        id: bundle
+        continue-on-error: true
+        with:
+          name: installer-flatpak
+          path: ./bundle
+
+      - name: Install flatpak and ostree
+        if: steps.bundle.outcome == 'success'
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q flatpak ostree
+
+      - name: Import the signing key
+        if: steps.bundle.outcome == 'success'
+        run: |
+          echo "${{ secrets.FLATPAK_GPG_KEY }}" | gpg --batch --import
+          echo "GPG_KEY=$(gpg --list-secret-keys --with-colons | awk -F: '/^sec/{print $5; exit}')" >> "$GITHUB_ENV"
+
+      - name: Rebuild the repository from the live site plus this release
+        if: steps.bundle.outcome == 'success'
+        run: |
+          VERSION=${GITHUB_REF_NAME#v}
+          mkdir -p site/repo
+          ostree init --repo=site/repo --mode=archive
+
+          # Previous state, if any. --mirror keeps the objects verbatim so the
+          # existing commit stays valid as the parent of the one imported below.
+          ostree remote add --repo=site/repo --no-gpg-verify previous "$SITE_URL/repo"
+          if ostree pull --repo=site/repo --mirror --depth=1 previous "app/$APP_ID/x86_64/master"; then
+            echo "pulled previous release from $SITE_URL/repo"
+          else
+            echo "no previous repository at $SITE_URL/repo — starting fresh"
+          fi
+          ostree remote delete --repo=site/repo previous
+
+          flatpak build-import-bundle --gpg-sign="$GPG_KEY" site/repo bundle/figma-linux-next_*_linux_x64.flatpak
+          flatpak build-update-repo --gpg-sign="$GPG_KEY" \
+            --title="figma-linux-next" \
+            --default-branch=master \
+            --generate-static-deltas \
+            --prune --prune-depth=1 \
+            site/repo
+
+          gpg --export "$GPG_KEY" > site/repo/figma-linux-next-repo.gpg
+          GPG_B64=$(base64 -w0 site/repo/figma-linux-next-repo.gpg)
+          FPR=$(gpg --list-keys --with-colons "$GPG_KEY" | awk -F: '/^fpr/{print $10; exit}')
+
+          cat > site/figma-linux-next.flatpakrepo <<EOF
+          [Flatpak Repo]
+          Title=figma-linux-next
+          Url=$SITE_URL/repo/
+          Homepage=https://github.com/marlon-borges/figma-linux-next
+          Comment=Unofficial Figma desktop client for Linux
+          Description=Unofficial Figma desktop client for Linux — native Wayland, GPU acceleration, system fonts, tray, KDE/GNOME frames.
+          Icon=https://raw.githubusercontent.com/marlon-borges/figma-linux-next/dev/resources/icons/256x256.png
+          GPGKey=$GPG_B64
+          EOF
+
+          cat > site/figma-linux-next.flatpakref <<EOF
+          [Flatpak Ref]
+          Name=$APP_ID
+          Branch=master
+          Title=figma-linux-next
+          Url=$SITE_URL/repo/
+          Homepage=https://github.com/marlon-borges/figma-linux-next
+          Comment=Unofficial Figma desktop client for Linux
+          IsRuntime=false
+          RuntimeRepo=https://dl.flathub.org/repo/flathub.flatpakrepo
+          GPGKey=$GPG_B64
+          EOF
+
+          cp resources/icons/128x128.png site/icon.png
+          sed -e "s|__VERSION__|$VERSION|g" \
+              -e "s|__HOST__|marlon-borges.github.io|g" \
+              -e "s|__PATH__|figma-linux-next|g" \
+              -e "s|__FPR__|$FPR|g" \
+              flatpak/pages/index.html > site/index.html
+          touch site/.nojekyll
+
+          echo "--- refs:"; ostree refs --repo=site/repo
+          echo "--- size:"; du -sh site
+
+      - uses: actions/upload-pages-artifact@v3
+        if: steps.bundle.outcome == 'success'
+        with:
+          path: site
+
+      - uses: actions/deploy-pages@v4
+        if: steps.bundle.outcome == 'success'
+        id: deploy
+
+  # Nix needs the archive's hash written into the repo, and that hash only exists
+  # once the binaries are built — so this cannot be part of bump_version.pl and
+  # has to land after the release is published. dev is where Nix resolves
+  # `github:marlon-borges/figma-linux-next` from, so dev is updated first and staging
+  # mirrored after; leaving dev for the next release PR would keep NixOS users a
+  # full release behind.
+  #
+  # RELEASE_PAT is a fine-grained token (Contents: write on this repo only) and is
+  # needed because the default GITHUB_TOKEN cannot push to a protected branch.
+  # This job runs last and depends on `release`, so if the push is rejected the
+  # release itself and its binaries are already out.
+  #
+  # Opt-in: runs only when the repository variable PUBLISH_NIX_FLAKE is "true"
+  # (and RELEASE_PAT, USER_NAME, EMAIL secrets are set).
+  flake:
+    needs: release
+    if: ${{ vars.PUBLISH_NIX_FLAKE == 'true' && !contains(github.ref_name, '-rc') && !contains(github.ref_name, '-alpha') && !contains(github.ref_name, '-beta') }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: dev
+          token: ${{ secrets.RELEASE_PAT }}
+
+      - name: Hash the released binaries
+        run: |
+          VERSION=${GITHUB_REF_NAME#v}
+          BASE="${{ github.server_url }}/${{ github.repository }}/releases/download/v${VERSION}"
+
+          # -f so a missing asset fails the job instead of hashing an error page.
+          X64=$(curl -sfL "$BASE/figma-linux-next_${VERSION}_linux_x64.zip" | sha256sum | cut -d' ' -f1)
+          ARM64=$(curl -sfL "$BASE/figma-linux-next_${VERSION}_linux_arm64.zip" | sha256sum | cut -d' ' -f1)
+
+          {
+            echo "VERSION=$VERSION"
+            echo "X64=$X64"
+            echo "ARM64=$ARM64"
+          } >> "$GITHUB_ENV"
+
+          # Kept outside the worktree so the staging step below can still run it
+          # after switching branches, whatever that branch contains.
+          cp scripts/update_flake_release.py /tmp/update_flake_release.py
+
+      - name: Commit to dev
+        run: |
+          git config user.name "${{ secrets.USER_NAME }}"
+          git config user.email "${{ secrets.EMAIL }}"
+          python3 /tmp/update_flake_release.py "$VERSION" "$X64" "$ARM64" flake.nix
+          git add flake.nix
+          git diff --staged --quiet || git commit -m "chore(nix): pin flake to v${VERSION}"
+          git push origin dev
+
+      - name: Mirror to staging
+        run: |
+          git fetch origin staging:staging
+          git checkout staging
+          python3 /tmp/update_flake_release.py "$VERSION" "$X64" "$ARM64" flake.nix
+          git add flake.nix
+          git diff --staged --quiet || git commit -m "chore(nix): pin flake to v${VERSION}"
+          git push origin staging
+
+  # bump_version.pl already wrote the tag into the manifest; only the commit sha
+  # can't be known before the tag exists, so it is pinned here. A bare tag is a
+  # movable pointer — pinning the sha is what makes the Flatpak build reproduce
+  # the exact code this release shipped.
+  #
+  # Runs after `flake` rather than beside it: both push to dev, and in parallel
+  # the loser would be rejected as non-fast-forward.
+  flatpak-pin:
+    needs: [release, flake]
+    if: ${{ vars.PUBLISH_NIX_FLAKE == 'true' && !contains(github.ref_name, '-rc') && !contains(github.ref_name, '-alpha') && !contains(github.ref_name, '-beta') }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: dev
+          token: ${{ secrets.RELEASE_PAT }}
+
+      - name: Pin the manifest to this release
+        env:
+          FIGMA_REPO_ROOT: ${{ github.workspace }}
+        run: |
+          VERSION=${GITHUB_REF_NAME#v}
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+
+          git config user.name "${{ secrets.USER_NAME }}"
+          git config user.email "${{ secrets.EMAIL }}"
+
+          # Kept outside the worktree so the staging step can still run it after
+          # switching branches, whatever that branch contains.
+          cp scripts/sync_flatpak_release.py /tmp/sync_flatpak_release.py
+
+          python3 /tmp/sync_flatpak_release.py --commit "${{ github.sha }}"
+          git add flatpak/
+          git diff --staged --quiet || git commit -m "chore(flatpak): pin manifest to v${VERSION}"
+          git push origin dev
+
+      - name: Mirror to staging
+        env:
+          FIGMA_REPO_ROOT: ${{ github.workspace }}
+        run: |
+          git fetch origin staging:staging
+          git checkout staging
+          python3 /tmp/sync_flatpak_release.py --commit "${{ github.sha }}"
+          git add flatpak/
+          git diff --staged --quiet || git commit -m "chore(flatpak): pin manifest to v${VERSION}"
+          git push origin staging

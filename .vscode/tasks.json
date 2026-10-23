@@ -1,0 +1,47 @@
+{
+  // See https://go.microsoft.com/fwlink/?LinkId=733558
+  // for the documentation about the tasks.json format
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "Run builder",
+      "type": "shell",
+      "command": "bun run builder"
+    },
+    {
+      "label": "Run Dev",
+      "type": "shell",
+      "command": "bun run dev"
+    },
+    {
+      "label": "Run Release",
+      "type": "shell",
+      "command": "bun run start"
+    },
+    {
+      "label": "Build",
+      "type": "shell",
+      "command": "bun run build"
+    },
+    {
+      "label": "Build & Run Release",
+      "type": "shell",
+      "command": "bun run build && bun run start"
+    },
+    {
+      "label": "Build & Run Dev",
+      "type": "shell",
+      "command": "bun run build && bun run dev"
+    },
+    {
+      "label": "Replace installed version",
+      "type": "shell",
+      "command": "cp -rf ./build/linux-unpacked/* /opt/figma-linux/"
+    },
+    {
+      "label": "Copy settings",
+      "type": "shell",
+      "command": "rm -rf ~/.config/Electron && cp -rf ~/.config/figma-linux ~/.config/Electron"
+    }
+  ]
+}

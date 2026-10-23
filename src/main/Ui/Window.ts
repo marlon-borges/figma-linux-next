@@ -1,0 +1,1512 @@
+import { randomUUID } from "node:crypto";
+import { app, BrowserWindow, type IpcMainEvent, type Rectangle, type Menu } from "electron";
+import { storage } from "Main/Storage";
+import { getResolvedFigmaTheme } from "Main/Theme";
+import SettingsView from "./SettingsView";
+import ChangelogView from "./ChangelogView";
+import TabPreviewView from "./TabPreviewView";
+import TabGroupPromptView from "./TabGroupPromptView";
+import { ModalViewManager } from "./ModalViewManager";
+import TabManager from "./TabManager";
+import { WarmTabManager } from "./WarmTabManager";
+import { WindowGeometry } from "./WindowGeometry";
+import { logger } from "../Logger";
+
+import {
+  HOMEPAGE,
+  TOPPANELHEIGHT,
+  NEW_PROJECT_TAB_URL,
+  NEW_FILE_TAB_TITLE,
+  TAB_GROUP_COLORS,
+} from "Const";
+import { WINDOW_DEFAULT_OPTIONS } from "Const/window";
+
+/** Cap on Window.recentlyPrunedGroups — deep enough for realistic undo,
+ *  bounded so a long session cannot accumulate dead groups forever. */
+const MAX_REMEMBERED_PRUNED_GROUPS = 20;
+import {
+  isDev,
+  isCommunityUrl,
+  isFileBrowserUrl,
+  isFigmaRunUrl,
+  isExportQueueUrl,
+  parseURL,
+  getTabDedupKey,
+} from "Utils/Common";
+import { panelUrlDev, panelUrlProd, resolveFrameStyle, toggleDetachedDevTools } from "Utils/Main";
+import { computeTabPreviewBounds, displayUrl, type PreviewAnchor } from "Utils/Main/tabPreview";
+import { computeTabGroupPromptBounds } from "Utils/Main/tabGroupPrompt";
+import Tab from "./Tab";
+import type MainTab from "./MainTab";
+import type CommunityTab from "./CommunityTab";
+import { SettingsTab } from "./SettingsTab";
+
+/** Settle time after the export-queue page loads, before its view is attached. */
+const EXPORT_QUEUE_ATTACH_DELAY_MS = 400;
+/** Attach the export-queue tab regardless, so a failed load can't leave it hidden. */
+const EXPORT_QUEUE_ATTACH_TIMEOUT_MS = 8000;
+
+export default class Window {
+  private window: BrowserWindow;
+  private geometry: WindowGeometry;
+  private tabManager: TabManager;
+  private settingsView: SettingsView;
+  private changelogView: ChangelogView;
+  private modalViews: ModalViewManager;
+  private settingsTab: SettingsTab;
+  // Hover card for strip tabs; created on the first hover (app.tabHoverPreviews).
+  private tabPreview: TabPreviewView | null = null;
+  // "New Group with This Tab" popover; created on first use.
+  private tabGroupPrompt: TabGroupPromptView | null = null;
+  // Tab group metadata for this window, keyed by group id. Membership itself
+  // lives on each live Tab (tab.groupId) — this map only holds label/color/
+  // collapsed/order. Persisted as `tabGroups` in Types.WindowState.
+  private tabGroups: Map<string, Types.TabGroup> = new Map();
+  // Groups pruned for having lost their last tab, kept so reopening that tab
+  // (Ctrl+Shift+T) puts it back into its group. Bounded — see rememberPrunedGroup.
+  private recentlyPrunedGroups: Map<string, Types.TabGroup> = new Map();
+  private state: Types.WindowState;
+  // Single-shot guard so the explicit pre-closeAll snapshot in close() is
+  // not overwritten by the BrowserWindow `close` event firing later with
+  // an already-cleared tabs map.
+  private stateCached = false;
+  /** Settings' pending edit was written; the window may close (see flushSettings). */
+  private settingsFlushed = false;
+  /** The panel page has loaded; until then a link waits (see openUrl). */
+  private panelLoaded = false;
+
+  private _userId: string;
+  private shown = false;
+  private static readonly SHOW_FALLBACK_MS = 3000;
+
+  // Loading skeleton is cleared by the Figma SPA's setLoading(false) signal.
+  // That signal is occasionally never delivered (dropped bridge message, a
+  // navigation Figma doesn't re-signal), leaving a tab stuck in the skeleton
+  // forever until a manual reload. The watchdog is a safety net: once the page
+  // itself has finished loading, give the SPA a grace window to signal, then
+  // force-clear. Override the grace with FIGMA_LOADING_WATCHDOG_MS (tests).
+  private static readonly LOADING_WATCHDOG_MS =
+    Number(process.env.FIGMA_LOADING_WATCHDOG_MS) || 8000;
+
+  // Warm tab: a pre-loaded "new file" tab kept in background for instant opening.
+  private warmTabs: WarmTabManager;
+
+  constructor(state: Types.WindowState) {
+    this.window = new BrowserWindow({
+      ...WINDOW_DEFAULT_OPTIONS,
+      ...state,
+      webPreferences: WINDOW_DEFAULT_OPTIONS.webPreferences,
+    });
+    this.geometry = new WindowGeometry(this.window);
+    this.tabManager = new TabManager(this.window.id);
+    this.settingsView = new SettingsView();
+    this.changelogView = new ChangelogView();
+    this.modalViews = new ModalViewManager(this.window, this.changelogView);
+    this.attachHidden(this.settingsView.view);
+    this.settingsTab = new SettingsTab({
+      view: this.settingsView.view,
+      bounds: () => this.calcBoundsForTabView(),
+      hideCurrentTab: () => {
+        const current = this.shownTab();
+        if (!current) return;
+        this.captureBeforeHiding(current);
+        current.view.setVisible(false);
+      },
+      refocusCurrentTab: () => this.refocusShownTab(),
+      notifyPanel: (channel, arg) => this.window.webContents.send(channel, arg),
+    });
+    this.warmTabs = new WarmTabManager(this.window.id, {
+      getUserId: () => this._userId,
+      getBgColor: () => this.figmaThemeBgColor,
+      attachHidden: (tab) => this.attachHidden(tab.view),
+      detach: (tab) => {
+        if (this.window.isDestroyed()) return;
+        try {
+          this.window.contentView.removeChildView(tab.view);
+        } catch {
+          // never attached
+        }
+      },
+    });
+    this.state = state;
+
+    this.window.contentView.addChildView(this.tabManager.mainTab.view);
+    this.updateTabsBounds();
+
+    this.registerEvents();
+
+    this.window.loadURL(isDev ? panelUrlDev : panelUrlProd);
+    if (isDev) toggleDetachedDevTools(this.window.webContents);
+    this.applyState();
+
+    // Hide-until-ready: keep the BrowserWindow hidden until the Panel renderer
+    // signals frontReady (see handleFrontReady). ready-to-show fires too early —
+    // it lands on Vite's empty HTML before Svelte mounts, producing a flash of
+    // a white top strip. The fallback timer guards against a broken renderer
+    // leaving the window hidden forever.
+    setTimeout(() => this.revealIfHidden(), Window.SHOW_FALLBACK_MS);
+  }
+
+  private revealIfHidden() {
+    if (this.shown || this.window.isDestroyed()) return;
+    this.shown = true;
+    this.window.show();
+  }
+
+  public get id() {
+    return this.window.id;
+  }
+  public get webContentId() {
+    return this.window.webContents.id;
+  }
+  public get settingsViewId() {
+    return this.settingsView.view.webContents.id;
+  }
+  public get changelogViewId() {
+    return this.changelogView.view.webContents.id;
+  }
+  public get mainTabInfo() {
+    return {
+      id: this.tabManager.mainTab.id,
+      url: this.tabManager.mainTab.view.webContents.getURL(),
+    };
+  }
+  public get communityTabInfo() {
+    return {
+      id: this.tabManager.communityTab ? this.tabManager.communityTab.id : -1,
+      url: this.tabManager.communityTab
+        ? this.tabManager.communityTab.view.webContents.getURL()
+        : "",
+    };
+  }
+  public get tabs() {
+    return this.tabManager.getAll();
+  }
+  public get win() {
+    return this.window;
+  }
+  public get allWebContentsIds() {
+    const ids = new Set<number>([
+      this.webContentId,
+      this.settingsViewId,
+      this.changelogViewId,
+      this.tabManager.mainTabWebContentId,
+      ...this.tabs.keys(),
+    ]);
+
+    if (this.tabManager.communityTabWebContentId) {
+      ids.add(this.tabManager.communityTabWebContentId);
+    }
+    if (this.tabPreview) {
+      ids.add(this.tabPreview.webContentsId);
+    }
+    if (this.tabGroupPrompt) {
+      ids.add(this.tabGroupPrompt.webContentsId);
+    }
+    // Include warm tab so IPC messages from it can be routed to this window
+    const warmId = this.warmTabs.activeWebContentsId;
+    if (warmId !== null) {
+      ids.add(warmId);
+    }
+
+    return [...ids];
+  }
+
+  public get userId(): string {
+    return this._userId;
+  }
+
+  public setUserId(id: string, sourceWebContentsId?: number) {
+    const previousId = this._userId;
+    this._userId = id;
+    this.tabManager.setUserId(id);
+
+    // The warm tab bakes the user id into its URL, so an account switch
+    // invalidates it. Tear down + reschedule (and schedule on first boot).
+    this.warmTabs.onUserIdChanged(previousId, id);
+
+    // Open project tabs also loaded under the previous account. Re-navigate
+    // them with the new fuid on an actual switch (never on first boot).
+    if (id && previousId && previousId !== id) {
+      this.tabManager.reapplyUserId(id, sourceWebContentsId);
+    }
+  }
+  public sortTabs(tabs: Types.TabFront[]) {
+    this.tabManager.sortTabs(tabs);
+    const previousGroupIds = new Set<string>();
+    for (const t of tabs) {
+      // getAll().get, not getById: the ids come from the renderer, and
+      // getById falls back to mainTab for an unknown one.
+      const tab = this.tabManager.getAll().get(t.id);
+      if (tab instanceof Tab) {
+        if (tab.groupId && tab.groupId !== t.groupId) {
+          previousGroupIds.add(tab.groupId);
+        }
+        tab.groupId = t.groupId;
+      }
+    }
+    for (const prevId of previousGroupIds) {
+      this.pruneEmptyGroup(prevId);
+    }
+  }
+  public getState(): Types.WindowState & { windowId: number } {
+    // During close, cacheStateBeforeClose() snapshots state into this.state
+    // BEFORE tabManager.closeAll() clears the tabs map. After closeAll,
+    // reading the live this.tabs would return an empty list, persisting
+    // tabs:[] and defeating saveLastOpenedTabs. isDestroyed() alone is not
+    // enough — BrowserWindow.close() is async, so isDestroyed can still be
+    // false while internal state is gone (getBounds throws).
+    if (this.stateCached || this.window.isDestroyed()) {
+      return { ...this.state, windowId: this.id };
+    }
+
+    const tabs: Types.SavedTab[] = [];
+
+    for (const [_, tab] of this.tabs) {
+      tabs.push({
+        title: tab.title,
+        url: tab.url,
+        groupId: tab.groupId,
+      });
+    }
+
+    const bounds = this.window.getBounds();
+
+    return {
+      ...bounds,
+      isMaximized: this.window.isMaximized(),
+      lastActiveTabPath: this.tabManager.getActiveTabPath(),
+      hasOpenedCommunityTab: this.tabManager.hasOpenedCommunityTab,
+      windowId: this.id,
+      userId: this._userId,
+      tabs,
+      tabGroups: this.getTabGroups(),
+    };
+  }
+
+  /** This window's tab groups, sorted for display/persistence. */
+  public getTabGroups(): Types.TabGroup[] {
+    return [...this.tabGroups.values()].sort((a, b) => a.order - b.order);
+  }
+
+  private cacheStateBeforeClose() {
+    if (this.stateCached) return;
+    if (this.window.isDestroyed()) return;
+    const { windowId: _, ...snapshot } = this.getState();
+    this.state = snapshot;
+    this.stateCached = true;
+  }
+  public restoreTabs(list?: Types.SavedTab[]) {
+    const tabs =
+      list ??
+      (
+        storage.settings.app.lastOpenedTabs as {
+          [key: string]: Types.SavedTab[];
+        }
+      )[this.id];
+
+    if (!tabs) {
+      return;
+    }
+
+    setTimeout(() => {
+      tabs.forEach((tab, i) => {
+        setTimeout(() => {
+          this.addTab(tab.url, tab.title, tab.groupId);
+          if (i + 1 === tabs.length) {
+            this.setTabFocusByPath(this.state.lastActiveTabPath);
+          }
+        }, 300 * i);
+      });
+    }, 100);
+  }
+  public calcBoundsForTabView(): Rectangle {
+    return this.geometry.calcBoundsForTabView();
+  }
+
+  public handleUrl(path: string) {
+    this.tabManager.handleUrl(path);
+    this.setFocusToMainTab();
+  }
+  public handlePluginManageAction(type: string) {
+    this.tabManager.mainTab.view.webContents.send("handlePluginMenuAction", { type });
+    this.setFocusToMainTab();
+  }
+  public handlePluginMenuAction(pluginMenuAction: Menu.MenuAction) {
+    this.tabManager.handlePluginMenuAction(pluginMenuAction);
+  }
+  public toggleDevTools() {
+    toggleDetachedDevTools(this.window.webContents);
+  }
+  public toggleSettingsDevTools() {
+    toggleDetachedDevTools(this.settingsView.view.webContents);
+  }
+  public toggleCurrentTabDevTools() {
+    const tab = this.tabManager.getById(this.tabManager.lastFocusedTab);
+
+    if (tab) {
+      toggleDetachedDevTools(tab.view.webContents);
+    }
+  }
+
+  /** Find an already-open tab matching this URL's dedup key. Prototype and editor
+   *  URLs for the same file have different dedup keys and therefore coexist.
+   *
+   *  With `app.allowDuplicateFileTabs` a document opens in a new tab even when it
+   *  is already open (#66) — except when the request comes from that file's own
+   *  tab. Prototypes and the export queue stay one tab each, or every Present
+   *  click would add another. */
+  private findTabForUrl(url: string, senderId?: number): Tab | undefined {
+    const key = getTabDedupKey(url);
+    if (!key) return undefined;
+    const duplicates = storage.settings.app.allowDuplicateFileTabs && key.startsWith("doc:");
+    for (const tab of this.tabManager.getAll().values()) {
+      const storedKey = tab.url ? getTabDedupKey(tab.url) : null;
+      const liveKey = getTabDedupKey(tab.getUrl());
+      if (storedKey !== key && liveKey !== key) continue;
+      if (!duplicates || tab.id === senderId) return tab;
+    }
+    return undefined;
+  }
+
+  public openUrlFromCommunity(url: string) {
+    const existing = this.findTabForUrl(url);
+    if (existing) {
+      this.setTabFocus(existing.id);
+      return;
+    }
+    const tab = this.addTab(url);
+    if (!tab) return;
+
+    this.setTabFocus(tab.id);
+  }
+
+  public openUrl(url: string) {
+    // A link that arrives while the window is still starting (a figma:// click
+    // as the app launches) would open its tab under a panel that can't hear
+    // about it yet — and the panel's load then puts Home in front of it. Wait;
+    // this listener runs after webContentDidFinishLoad, so the file ends on top.
+    if (!this.panelLoaded) {
+      this.window.webContents.once("did-finish-load", () => this.openUrl(url));
+      return;
+    }
+    if (isFileBrowserUrl(url)) {
+      this.tabManager.loadUrlInMainTab(url);
+      this.setFocusToMainTab();
+      return;
+    }
+    if (isCommunityUrl(url)) {
+      const parsed = parseURL(url);
+      this.handleUrl(`${parsed.pathname}${parsed.search}`);
+      this.setFocusToMainTab();
+    } else if (/figma:\/\//.test(url)) {
+      const httpUrl = url.replace(/figma:\//, HOMEPAGE);
+      const existing = this.findTabForUrl(httpUrl);
+      if (existing) {
+        this.setTabFocus(existing.id);
+        return;
+      }
+      const tab = this.addTab(httpUrl);
+      if (tab) this.setTabFocus(tab.id);
+    } else if (/https?:\/\//.test(url)) {
+      const existing = this.findTabForUrl(url);
+      if (existing) {
+        this.setTabFocus(existing.id);
+        return;
+      }
+      const tab = this.addTab(url);
+      if (!tab) return;
+
+      if (isExportQueueUrl(url)) {
+        this.focusTabWhenLoaded(tab);
+      } else {
+        this.setTabFocus(tab.id);
+      }
+    }
+  }
+  public focus() {
+    // Reached from the tray as well, where the window may be minimised or
+    // hidden — focus() alone does not un-minimise on any platform.
+    if (this.window.isMinimized()) this.window.restore();
+    if (!this.window.isVisible()) this.window.show();
+    this.window.focus();
+  }
+  public showHandler(event: IpcMainEvent) {
+    const scale = storage.settings.ui.scalePanel;
+
+    this.updatePanelScale(event, scale);
+  }
+
+  public updatePanelScale(_: IpcMainEvent, scale: number) {
+    const panelScale = +scale.toFixed(2);
+
+    storage.settings.app.panelHeight = Math.floor(TOPPANELHEIGHT * panelScale);
+    storage.settings.ui.scalePanel = panelScale;
+
+    this.window.webContents.send("setPanelScale", panelScale, storage.settings.app.panelHeight);
+
+    this.updateTabsBounds();
+  }
+  public updateFigmaUiScale(_: IpcMainEvent, scale: number) {
+    this.tabManager.updateScaleAll(scale);
+  }
+
+  public setFrameStyle(style: Types.FrameStyle) {
+    this.window.webContents.send("frameStyleChanged", style);
+  }
+
+  public setFigmaTheme(theme: Types.ResolvedTheme) {
+    this.window.webContents.send("figmaThemeChanged", theme);
+  }
+
+  public getBounds() {
+    return this.window.getBounds();
+  }
+  public updateTabsBounds() {
+    const bounds = this.calcBoundsForTabView();
+    this.tabManager.setBoundsForActiveTab(bounds);
+    this.settingsTab.syncBounds();
+    this.modalViews.syncBounds(this.window.getBounds());
+    this.hideTabPreview();
+    this.hideTabGroupPrompt();
+  }
+
+  public updateAllTabsBounds() {
+    const bounds = this.calcBoundsForTabView();
+    this.tabManager.setBoundsForAllTab(bounds);
+    this.settingsTab.syncBounds();
+    this.modalViews.syncBounds(this.window.getBounds());
+  }
+  public closeAllTab(_: IpcMainEvent) {
+    const tabs = this.tabManager.getAll();
+
+    for (const [_, tab] of tabs) {
+      this.window.contentView.removeChildView(tab.view);
+    }
+
+    this.tabManager.closeAll();
+    this.tabGroups.clear();
+
+    this.window.webContents.send("closeAllTabs");
+  }
+  public loadLoginPageAllWindows() {
+    this.tabManager.loadLoginPage();
+  }
+  public newTabInGroup(groupId: string): void {
+    if (this.tabManager.hasOpenedNewFileTab) {
+      const existing = this.tabManager.getByTitle(NEW_FILE_TAB_TITLE);
+      if (existing) {
+        this.addTabToGroup(existing.id, groupId);
+        this.setTabFocus(existing.id);
+      }
+      return;
+    }
+    this.newProject(groupId);
+  }
+
+  public newProject(groupId?: string) {
+    if (this.tabManager.hasOpenedNewFileTab) {
+      return;
+    }
+
+    const ready = this.warmTabs.takeWarmTab();
+    if (ready) {
+      // Promote the pre-warmed tab — instant, no loading delay
+      this.tabManager.promoteWarmTab(ready.tab);
+      if (groupId) {
+        ready.tab.groupId = groupId;
+      }
+      this.window.webContents.send("didTabAdd", {
+        id: ready.tab.id,
+        url: ready.tab.url,
+        title: NEW_FILE_TAB_TITLE,
+        // If the SPA hasn't fired its readiness signal yet, render the
+        // skeleton — the next setLoading(false) from the SPA clears it.
+        // Without this flag, the renderer never paints a placeholder and
+        // a not-yet-bootstrapped warm tab promotion shows a blank page.
+        loading: !ready.wasBootstrapped,
+        groupId: ready.tab.groupId,
+      });
+      this.setTabFocus(ready.tab.id);
+    } else {
+      // Fallback: warm tab not ready yet, create normally
+      const tab = this.addTab(
+        `${NEW_PROJECT_TAB_URL}?fuid=${this._userId}`,
+        NEW_FILE_TAB_TITLE,
+        groupId,
+      );
+      if (tab) {
+        this.setTabFocus(tab.id);
+      }
+    }
+
+    this.window.webContents.send("newFileBtnVisible", false);
+  }
+  public createFile(args: WebApi.CreateFile) {
+    const newFileTab = this.tabManager.getByTitle(NEW_FILE_TAB_TITLE);
+    const tab = this.addTab(
+      args.url,
+      undefined,
+      newFileTab instanceof Tab ? newFileTab.groupId : undefined,
+    );
+    if (!tab) return false;
+
+    tab.loadUrl(args.url);
+    // newFileTab may be absent (e.g. the file was opened without going through
+    // the New-file tab); guard like closeNewFileTab() does — otherwise
+    // newFileTab.id throws and the just-created tab is left unfocused.
+    if (newFileTab) {
+      this.closeTab(newFileTab.id);
+      this.tabWasClosed(newFileTab.id);
+    }
+
+    this.window.webContents.send("newFileBtnVisible", true);
+
+    this.setTabFocus(tab.id);
+
+    return true;
+  }
+  public openMainMenuCloseHandler() {
+    setTimeout(() => {
+      this.window.webContents.send("isMainMenuOpen", false);
+    }, 150);
+  }
+  public hasWebContentId(webContentsId: number) {
+    return this.tabManager.getAll().has(webContentsId);
+  }
+
+  /**
+   * Ask the panel for the triggering tab's on-screen rect (see ipc.svelte.ts's
+   * "promptNewTabGroup" listener) — the popover itself only opens once that
+   * rect comes back over "tabGroupPromptAnchor" (see showTabGroupPrompt).
+   */
+  public promptNewTabGroup(tabId: number) {
+    if (!this.tabManager.getAll().has(tabId)) return;
+    this.window.webContents.send("promptNewTabGroup", tabId);
+  }
+
+  /**
+   * Show the "New Group with This Tab" popover anchored under `tabId`'s rect
+   * in the panel. `anchor` comes from the panel's reply to `promptNewTabGroup`
+   * (see WindowManager.tabGroupPromptAnchor) — the same hand-off tabHoverStart
+   * uses for the preview card.
+   */
+  public showTabGroupPrompt(tabId: number, anchor: PreviewAnchor) {
+    if (!this.tabManager.getAll().has(tabId)) return;
+    this.showGroupPromptAt(anchor, {
+      mode: "create",
+      tabId,
+      label: "",
+      color: TAB_GROUP_COLORS[0],
+      frame: resolveFrameStyle(storage.settings.app),
+      theme: getResolvedFigmaTheme(),
+    });
+  }
+
+  /**
+   * Same hand-off as promptNewTabGroup, for renaming/recoloring an existing
+   * group: main asks the panel for the group chip's rect, the panel answers
+   * over "tabGroupEditAnchor", and only then does the popover open —
+   * pre-filled with the group's current label and color.
+   */
+  public promptEditTabGroup(groupId: string) {
+    if (!this.tabGroups.has(groupId)) return;
+    this.window.webContents.send("promptEditTabGroup", groupId);
+  }
+
+  public showTabGroupEditPrompt(groupId: string, anchor: PreviewAnchor) {
+    const group = this.tabGroups.get(groupId);
+    if (!group) return;
+    this.showGroupPromptAt(anchor, {
+      mode: "edit",
+      groupId,
+      label: group.label,
+      color: group.color,
+      frame: resolveFrameStyle(storage.settings.app),
+      theme: getResolvedFigmaTheme(),
+    });
+  }
+
+  private showGroupPromptAt(anchor: PreviewAnchor, payload: Types.TabGroupPromptPayload) {
+    if (this.window.isDestroyed()) return;
+
+    const content = this.window.getContentBounds();
+    const bounds = computeTabGroupPromptBounds({
+      anchor,
+      panelHeight: storage.settings.app.panelHeight || TOPPANELHEIGHT,
+      contentWidth: content.width,
+      contentHeight: content.height,
+    });
+
+    this.tabGroupPrompt ??= new TabGroupPromptView(this.window);
+    this.tabGroupPrompt.show(bounds, payload);
+  }
+
+  /** Rename and/or recolor an existing group. */
+  public updateTabGroup(groupId: string, label: string, color: string): void {
+    const group = this.tabGroups.get(groupId);
+    if (!group) return;
+    const trimmed = label.trim();
+    if (!trimmed) return;
+    if (group.label === trimmed && group.color === color) return;
+
+    group.label = trimmed;
+    group.color = color;
+    this.window.webContents.send("tabGroupsChanged", this.getTabGroups());
+  }
+
+  public hideTabGroupPrompt() {
+    this.tabGroupPrompt?.hide();
+  }
+
+  public createTabGroupWithTab(tabId: number, label: string, color: string): void {
+    if (!this.tabManager.getAll().has(tabId)) return;
+    const trimmed = label.trim();
+    if (!trimmed) return;
+
+    const group: Types.TabGroup = {
+      id: randomUUID(),
+      label: trimmed,
+      color,
+      collapsed: false,
+      order: this.tabGroups.size,
+    };
+    const previousGroupId = this.tabManager.getAll().get(tabId)?.groupId;
+    this.tabGroups.set(group.id, group);
+    this.tabManager.setGroupId(tabId, group.id);
+    // Moving the tab can empty its old group, same as addTabToGroup.
+    if (previousGroupId) this.pruneEmptyGroup(previousGroupId);
+
+    // tabGroupsChanged first: the renderer clusters/reorders tabs on setTabGroup
+    // using its local group list, which must already know about this new group.
+    this.window.webContents.send("tabGroupsChanged", this.getTabGroups());
+    this.window.webContents.send("setTabGroup", { id: tabId, groupId: group.id });
+  }
+
+  public addTabToGroup(tabId: number, groupId: string): void {
+    const tab = this.tabManager.getAll().get(tabId);
+    if (!tab || !this.tabGroups.has(groupId)) return;
+
+    const previousGroupId = tab.groupId;
+    this.tabManager.setGroupId(tabId, groupId);
+    this.window.webContents.send("setTabGroup", { id: tabId, groupId });
+
+    if (previousGroupId && previousGroupId !== groupId) {
+      this.pruneEmptyGroup(previousGroupId);
+    }
+  }
+
+  public removeTabFromGroup(tabId: number): void {
+    const tab = this.tabManager.getAll().get(tabId);
+    if (!tab?.groupId) return;
+
+    const previousGroupId = tab.groupId;
+    this.tabManager.setGroupId(tabId, undefined);
+    this.window.webContents.send("setTabGroup", { id: tabId, groupId: undefined });
+    this.pruneEmptyGroup(previousGroupId);
+  }
+
+  public setTabGroupCollapsed(groupId: string, collapsed: boolean): void {
+    const group = this.tabGroups.get(groupId);
+    if (!group || group.collapsed === collapsed) return;
+    group.collapsed = collapsed;
+  }
+
+  /** Chrome/Figma-style auto-cleanup: a group with no member tabs left disappears. */
+  private pruneEmptyGroup(groupId: string): void {
+    const stillUsed = [...this.tabManager.getAll().values()].some((t) => t.groupId === groupId);
+    if (stillUsed) return;
+
+    const group = this.tabGroups.get(groupId);
+    if (group) {
+      this.rememberPrunedGroup(group);
+    }
+    this.tabGroups.delete(groupId);
+    this.window.webContents.send("tabGroupsChanged", this.getTabGroups());
+  }
+
+  /** Remember a pruned group for a possible reopen, oldest entry out first —
+   *  unbounded, this map grew for the whole life of the window. */
+  private rememberPrunedGroup(group: Types.TabGroup): void {
+    // Re-inserting moves the key to the end of the Map's insertion order,
+    // which is what makes the eviction below least-recently-pruned.
+    this.recentlyPrunedGroups.delete(group.id);
+    this.recentlyPrunedGroups.set(group.id, group);
+    while (this.recentlyPrunedGroups.size > MAX_REMEMBERED_PRUNED_GROUPS) {
+      const oldest = this.recentlyPrunedGroups.keys().next();
+      if (oldest.done) break;
+      this.recentlyPrunedGroups.delete(oldest.value);
+    }
+  }
+
+  public ungroup(groupId: string): void {
+    for (const tab of this.tabManager.getAll().values()) {
+      if (tab.groupId === groupId) {
+        tab.groupId = undefined;
+        this.window.webContents.send("setTabGroup", { id: tab.id, groupId: undefined });
+      }
+    }
+    this.tabGroups.delete(groupId);
+    this.window.webContents.send("tabGroupsChanged", this.getTabGroups());
+  }
+
+  /**
+   * Close every tab of a group. Each tab goes through `closeOne`, which must
+   * also tell the panel (`tabWasClosed`) — `closeTab` alone only tears down the
+   * view, and the strip would keep the closed tabs as dead entries.
+   * WindowManager passes its handleCloseTab so the tabs also land in the
+   * closed-tab history for Ctrl+Shift+T.
+   */
+  public closeTabGroup(
+    groupId: string,
+    closeOne: (tabId: number) => void = (tabId) => {
+      this.closeTab(tabId);
+      this.tabWasClosed(tabId);
+    },
+  ): void {
+    const toClose: number[] = [];
+    for (const tab of this.tabManager.getAll().values()) {
+      if (tab.groupId === groupId) {
+        toClose.push(tab.id);
+      }
+    }
+    for (const tabId of toClose) {
+      closeOne(tabId);
+    }
+    this.tabGroups.delete(groupId);
+    this.window.webContents.send("tabGroupsChanged", this.getTabGroups());
+  }
+
+  public getTabInfo(tabId: number) {
+    const tab = this.tabManager.getById(tabId);
+    if (!tab) {
+      return {
+        id: tabId,
+        title: "",
+        url: "",
+      };
+    }
+
+    const url = tab.getUrl();
+
+    return {
+      id: tabId,
+      title: tab instanceof Tab ? tab.title : "",
+      url,
+      groupId: tab instanceof Tab ? tab.groupId : undefined,
+    };
+  }
+
+  public addTab(url: string, title?: string, groupId?: string) {
+    const parsedUrl = parseURL(url);
+    if (!parsedUrl) {
+      logger.warn(`addTab: invalid URL "${url}", skipping`);
+      return null;
+    }
+    parsedUrl.searchParams.set("fuid", this._userId);
+
+    const tab = this.tabManager.addTab(parsedUrl.toString(), title);
+    if (groupId) {
+      if (!this.tabGroups.has(groupId) && this.recentlyPrunedGroups.has(groupId)) {
+        const group = this.recentlyPrunedGroups.get(groupId)!;
+        this.tabGroups.set(groupId, group);
+        this.recentlyPrunedGroups.delete(groupId);
+        this.window.webContents.send("tabGroupsChanged", this.getTabGroups());
+      }
+      if (this.tabGroups.has(groupId)) {
+        tab.groupId = groupId;
+      }
+    }
+    tab.view.setBackgroundColor(this.figmaThemeBgColor);
+    this.attachHidden(tab.view);
+
+    // Non-Figma tabs (chrome://gpu, about:*) don't run figmaApi, so Figma's
+    // setLoading IPC never arrives. Without this flag the renderer skeleton
+    // covers the real title forever. For Figma URLs leave loading default-true;
+    // setLoading(false) clears it once the canvas is ready.
+    const isFigma = isFigmaRunUrl(url);
+    this.window.webContents.send("didTabAdd", {
+      id: tab.id,
+      url,
+      title,
+      editorType: tab.editorType,
+      loading: isFigma,
+      groupId: tab.groupId,
+    });
+
+    if (isFigma) {
+      this.armLoadingWatchdog(tab);
+    }
+
+    return tab;
+  }
+
+  /**
+   * Figma's video-export queue never joins the file when its tab is attached
+   * before the page loads: it renders "Your rendering queue is empty" and stays
+   * that way, while the render is in fact queued and progressing. Switching
+   * tabs away and back is the only thing that fixes it — reload, resize,
+   * maximise and window focus all fail, and a CDP session shows nothing that
+   * distinguishes the stuck page from a working one (visibilityState stays
+   * "visible" with no event fired, the size is identical across the switch,
+   * requestAnimationFrame runs at 60fps, and the preload bridge is installed).
+   *
+   * What that manual switch really does is let the page finish loading while
+   * detached, then attach it. So instead of attaching immediately and nudging
+   * afterwards, hold the tab back: it loads in the background at 0x0 exactly
+   * like a warm tab, and gets attached once it is ready. The tab strip still
+   * shows it right away — addTab already sent didTabAdd — only the view is
+   * deferred.
+   *
+   * The timer is a fallback: if did-finish-load never arrives (offline, a
+   * redirect loop), the tab must still become visible rather than hang unseen.
+   */
+  private focusTabWhenLoaded(tab: Tab) {
+    const wc = tab.view.webContents;
+    let shown = false;
+
+    const show = () => {
+      if (shown || wc.isDestroyed()) return;
+      shown = true;
+      this.setTabFocus(tab.id);
+    };
+
+    wc.once("did-finish-load", () => setTimeout(show, EXPORT_QUEUE_ATTACH_DELAY_MS));
+    setTimeout(show, EXPORT_QUEUE_ATTACH_TIMEOUT_MS);
+  }
+
+  /**
+   * Safety net for a stuck loading skeleton: when the tab's page finishes
+   * loading, give the Figma SPA a grace window to fire its own
+   * setLoading(false); if it never does, force-clear the skeleton so the tab
+   * can't stay in the loading state forever. Idempotent — a redundant
+   * setLoading(false) after the SPA already cleared it is harmless. Re-arms on
+   * every full load (e.g. a reload), and the destroyed-guard makes a pending
+   * timer a no-op once the tab is gone.
+   */
+  private armLoadingWatchdog(tab: Tab) {
+    const wc = tab.view.webContents;
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    wc.on("did-finish-load", () => {
+      if (timer) clearTimeout(timer);
+      timer = setTimeout(() => {
+        // The window can be closed during the grace window; guard both the tab
+        // WebContents and the window before sending, or the send() throws.
+        if (!wc.isDestroyed() && !this.window.isDestroyed()) {
+          this.window.webContents.send("setLoading", tab.id, false);
+        }
+      }, Window.LOADING_WATCHDOG_MS);
+    });
+  }
+
+  /** Open Settings as a tab, or bring it to the front if it already is one. */
+  public openSettingsView() {
+    // Same race as openUrl: opened while the window starts (tray → Settings),
+    // the panel's load would put Home in front of it and miss settingsTabOpened.
+    if (!this.panelLoaded) {
+      this.window.webContents.once("did-finish-load", () => this.openSettingsView());
+      return;
+    }
+    this.hideTabPreview();
+    this.hideTabGroupPrompt();
+    this.settingsTab.show();
+    if (isDev) toggleDetachedDevTools(this.settingsView.view.webContents);
+    app.emit("needUpdateMenu", this.id, null, { "close-tab": true });
+  }
+  public closeSettingsView() {
+    this.settingsView.closeDevTools();
+    this.settingsTab.close();
+  }
+  public get isSettingsTabShown() {
+    return this.settingsTab.isShown;
+  }
+
+  /**
+   * Write an edit still waiting in Settings' autosave delay. The page dies
+   * with the window, and with it a save timer that hasn't fired yet — so
+   * everything that closes the window or quits the app awaits this first.
+   * Bounded: a hung renderer must not keep the window open.
+   */
+  public async flushSettings(): Promise<void> {
+    const wc = this.settingsView.view.webContents;
+    if (!wc.isDestroyed()) {
+      await Promise.race([
+        wc.executeJavaScript("window.__flushSettings?.()").catch(() => {}),
+        new Promise((resolve) => setTimeout(resolve, 1000)),
+      ]);
+    }
+    this.settingsFlushed = true;
+  }
+
+  public openChangelogView() {
+    this.modalViews.openChangelogView();
+  }
+  public closeChangelogView() {
+    this.modalViews.closeChangelogView();
+  }
+  public get isChangelogViewOpen() {
+    return this.modalViews.isChangelogViewOpen;
+  }
+  public toggleFullScreen() {
+    if (this.window.isFullScreen()) {
+      this.window.setFullScreen(false);
+    } else {
+      this.window.setFullScreen(true);
+    }
+  }
+  private onEnterFullScreen() {
+    const tab = this.tabManager.getById(this.tabManager.lastFocusedTab);
+
+    if (tab) {
+      tab.view.webContents.send("handleSetFullScreen", true);
+    }
+  }
+  private onLeaveFullScreen() {
+    const tab = this.tabManager.getById(this.tabManager.lastFocusedTab);
+
+    if (tab) {
+      tab.view.webContents.send("handleSetFullScreen", false);
+    }
+  }
+  private applyState() {
+    const { x, y, height, width, userId, tabs, tabGroups, isMaximized } = this.state;
+    if (userId) this.setUserId(userId);
+
+    if (storage.settings.app.saveLastOpenedTabs) {
+      for (const group of tabGroups ?? []) {
+        this.tabGroups.set(group.id, group);
+      }
+
+      if (tabs && tabs.length > 0) {
+        this.window.webContents.once("did-finish-load", () => this.restoreTabs(tabs));
+      }
+    }
+
+    this.win.setBounds({ x, y, width, height });
+
+    if (isMaximized) {
+      this.win.maximize();
+    }
+  }
+
+  public setLoading(event: IpcMainEvent, args: WebApi.SetLoading) {
+    const tabId = event.sender.id;
+
+    // Warm tab signals readiness via setLoading(false). Track it so the
+    // promoter knows whether to show the skeleton placeholder — promoting
+    // a not-yet-bootstrapped warm tab without the skeleton lands the user
+    // on a blank black page until the SPA finally renders.
+    if (this.warmTabs.handleSetLoading(tabId, args.loading)) {
+      return;
+    }
+
+    const tab = this.tabManager.getById(tabId);
+
+    if (!tab) {
+      return;
+    }
+
+    this.window.webContents.send("setLoading", tabId, args.loading);
+  }
+  public windowMinimize(_: IpcMainEvent) {
+    this.window.minimize();
+  }
+  public windowMaximize(event: IpcMainEvent) {
+    if (!this.window || this.window.isDestroyed()) {
+      return;
+    }
+
+    if (this.window.isMaximized()) {
+      this.window.restore();
+      event.reply("windowDidRestored");
+    } else {
+      this.window.maximize();
+      event.reply("windowDidMaximized");
+    }
+  }
+  private webContentDidFinishLoad() {
+    if (this.state.hasOpenedCommunityTab) {
+      this.openCommunity({
+        path: "/@figma_linux",
+        userId: this._userId,
+      });
+    }
+
+    this.setFocusToMainTab();
+    this.panelLoaded = true;
+  }
+  public setMenu(menu: Menu) {
+    this.window.setMenu(menu);
+  }
+  public closeNewFileTab() {
+    const newFileTab = this.tabManager.getByTitle(NEW_FILE_TAB_TITLE);
+
+    if (!newFileTab) {
+      return;
+    }
+
+    this.closeTab(newFileTab.id);
+    this.tabWasClosed(newFileTab.id);
+    this.window.webContents.send("newFileBtnVisible", true);
+  }
+
+  public setIsInVoiceCall(tabId: number, isInVoiceCall: boolean) {
+    this.window.webContents.send("setIsInVoiceCall", { id: tabId, isInVoiceCall });
+  }
+  public setUsingMicrophone(tabId: number, isUsingMicrophone: boolean) {
+    this.window.webContents.send("setUsingMicrophone", { id: tabId, isUsingMicrophone });
+  }
+  public reload() {
+    this.window.reload();
+  }
+  public reloadTab(tabId: number) {
+    this.tabManager.reloadTab(tabId);
+  }
+  public closeTab(tabId: number) {
+    // Guard: reject IDs that are not in the active tab list.
+    // TabManager.getById() falls back to mainTab for unknown IDs, which would
+    // cause mainTab to be removed from contentView on double-close (e.g. when
+    // renderer sends closeTab after setFocusToMainTab already closed it internally).
+    if (!this.tabManager.getAll().has(tabId)) {
+      return;
+    }
+
+    const tab = this.tabManager.getById(tabId);
+
+    if (!tab) {
+      return;
+    }
+
+    const isNewFileTab = this.tabManager.isNewFileTab(tabId);
+    const groupId = tab instanceof Tab ? tab.groupId : undefined;
+
+    this.hideTabPreview();
+    this.hideTabGroupPrompt();
+    this.window.contentView.removeChildView(tab.view);
+
+    const nextTabId = this.tabManager.close(tabId);
+
+    if (groupId) this.pruneEmptyGroup(groupId);
+
+    if (this.tabManager.lastFocusedTab === tabId && this.settingsTab.isShown) {
+      // The tab under Settings closed. Settings stays in front; the neighbour
+      // becomes the tab underneath and comes back when Settings closes.
+      if (!isNewFileTab) this.tabManager.focusTab(nextTabId);
+      else if (this.tabManager.hasOpenedCommunityTab) this.tabManager.focusCommunityTab();
+      else this.tabManager.focusMainTab();
+    } else if (this.tabManager.lastFocusedTab === tabId) {
+      if (isNewFileTab) {
+        if (this.tabManager.hasOpenedCommunityTab) {
+          this.setFocusToCommunityTab();
+        } else {
+          this.setFocusToMainTab();
+        }
+      } else {
+        this.tabManager.focusTab(nextTabId);
+        this.window.webContents.send("focusTab", nextTabId);
+
+        switch (nextTabId) {
+          case "mainTab": {
+            this.setFocusToMainTab();
+            break;
+          }
+          case "communityTab": {
+            this.setFocusToCommunityTab();
+            break;
+          }
+          default: {
+            this.setTabFocus(nextTabId);
+          }
+        }
+      }
+    }
+
+    if (!this.tabManager.hasOpenedNewFileTab) {
+      this.window.webContents.send("newFileBtnVisible", true);
+    }
+  }
+  public getLatestFocusedTabId() {
+    return this.tabManager.lastFocusedTab;
+  }
+
+  /** True when `webContentsId` belongs to the tab currently shown in this window. */
+  public isFocusedTab(webContentsId: number): boolean {
+    // lastFocusedTab holds a webContents id for every tab kind, mainTab included.
+    return webContentsId === this.tabManager.lastFocusedTab;
+  }
+
+  /** Execute arbitrary JS from within the active Figma WebContentsView context. */
+  public executeInBrowserView(script: string): Promise<unknown> {
+    const tab = this.tabManager.getById(this.tabManager.lastFocusedTab);
+    if (!tab) return Promise.resolve(undefined);
+    return tab.view.webContents.executeJavaScript(script);
+  }
+
+  /** Execute a fetch from within the active Figma WebContentsView context.
+   *  Uses relative paths on www.figma.com so session cookies are sent automatically.
+   *  @param path - relative path, e.g. "/api/files/{key}/nodes?ids=..." */
+  public figmaApiFetch(path: string): Promise<unknown> {
+    return this.executeInBrowserView(`
+      fetch(${JSON.stringify(path)})
+        .then(r => r.ok ? r.json() : r.text().then(t => ({ error: r.status + ": " + t })))
+        .catch(e => ({ error: e.message }))
+    `);
+  }
+  public tabWasClosed(tabId: number) {
+    this.window.webContents.send("tabWasClosed", tabId);
+  }
+  public setFocusToMainTab() {
+    const mainTab = this.tabManager.mainTab;
+
+    this.swapTo(mainTab);
+    this.tabManager.focusMainTab();
+    this.closeNewFileTab();
+    this.window.webContents.send("focusTab", "mainTab");
+
+    app.emit("needUpdateMenu", this.id, null, { "close-tab": false });
+  }
+  public setFocusToCommunityTab() {
+    const bounds = this.calcBoundsForTabView();
+    const communityTab = this.tabManager.communityTab;
+
+    this.swapTo(communityTab);
+    this.tabManager.focusCommunityTab();
+    this.closeNewFileTab();
+    this.tabManager.communityTab.setBounds(bounds);
+    this.window.webContents.send("focusTab", "communityTab");
+
+    app.emit("needUpdateMenu", this.id, null, { "close-tab": true });
+  }
+  public setTabFocusByPath(path: string) {
+    const tab = this.tabManager.getByPath(path);
+
+    if (tab) {
+      this.setTabFocus(tab.id);
+    } else {
+      if (/recents/.test(path)) {
+        this.setFocusToMainTab();
+        this.tabManager.loadUrlInMainTab(`${HOMEPAGE}${path}`);
+      }
+      if (/community/.test(path)) {
+        this.setFocusToCommunityTab();
+        this.tabManager.loadUrlInCommunityTab(`${HOMEPAGE}${path}`);
+      }
+    }
+  }
+  public loadUrlMainTab(url: string) {
+    this.tabManager.mainTab.loadUrl(url);
+  }
+  public completeFigmaAuthInMainTab(gSecret: string, path?: string) {
+    // Forward the g_secret to MainTab's renderer; the page-side handler
+    // completes the redeem in-place so multi-user state survives. `path`
+    // stays undefined when the auth flow stayed on MainTab — the page may
+    // concatenate HOMEPAGE+path on completion, and passing "" or null
+    // produces "https://www.figma.comnull/" → empty screen.
+    this.tabManager.mainTab.view.webContents.send("figma:complete-auth", gSecret, path);
+  }
+  public setTabFocus(tabId: number) {
+    const tab = this.tabManager.getById(tabId);
+    if (!tab) return;
+
+    const bounds = this.calcBoundsForTabView();
+
+    this.hideTabPreview();
+    this.hideTabGroupPrompt();
+    this.swapTo(tab);
+
+    // Catch up a tab whose account-switch refresh was deferred while it was
+    // in the background (see TabManager.reapplyUserId) — a no-op otherwise.
+    // Applied AFTER swapTo, not before: navigating a WebContentsView while
+    // it's still hidden and only then calling setVisible can leave it
+    // unpainted until another visibility toggle on Wayland/Electron 44 (the
+    // "Child views are attached once" gotcha).
+    this.tabManager.applyPendingUserId(tabId);
+
+    this.tabManager.focusTab(tabId);
+    this.tabManager.setBounds(tabId, bounds);
+    this.window.webContents.send("focusTab", tabId);
+
+    app.emit("needUpdateMenu", this.id, tabId, { "close-tab": true });
+  }
+  public focusNextTab() {
+    const nextId = this.tabManager.getNextTabId(this.tabManager.lastFocusedTab);
+    if (nextId !== undefined) this.setTabFocus(nextId);
+  }
+  public focusPrevTab() {
+    const prevId = this.tabManager.getPrevTabId(this.tabManager.lastFocusedTab);
+    if (prevId !== undefined) this.setTabFocus(prevId);
+  }
+  public setTabTitle(event: IpcMainEvent, title: string) {
+    // Ignore title updates from the warm tab (not yet promoted to active tab)
+    if (this.warmTabs.isWarmTab(event.sender.id)) return;
+
+    const tab = this.tabManager.getById(event.sender.id);
+
+    if (!tab || (tab instanceof Tab && tab.title === NEW_FILE_TAB_TITLE)) {
+      return;
+    }
+
+    this.tabManager.setTitle(tab.id, title);
+    if (tab?.view?.webContents) {
+      this.window.webContents.send("setTitle", { id: tab.view.webContents.id, title });
+    }
+  }
+  public openFile(event: IpcMainEvent, ...args: string[]) {
+    let url = `${HOMEPAGE}${args[0]}`;
+
+    if (args[2]) {
+      url = `${url}${args[2]}`;
+    }
+
+    if (event?.sender?.id === this.tabManager.mainTabWebContentId && isFileBrowserUrl(url)) {
+      this.loadUrlMainTab(url);
+      this.setFocusToMainTab();
+      return;
+    }
+
+    const newFileTab = this.tabManager.getByTitle(NEW_FILE_TAB_TITLE);
+    const targetGroupId = newFileTab instanceof Tab ? newFileTab.groupId : undefined;
+
+    const existing = this.findTabForUrl(url, event?.sender?.id);
+    if (existing) {
+      if (targetGroupId && !existing.groupId) {
+        this.addTabToGroup(existing.id, targetGroupId);
+      }
+      this.closeNewFileTab();
+      this.setTabFocus(existing.id);
+      return;
+    }
+
+    const tab = this.addTab(url, undefined, targetGroupId);
+    if (tab) {
+      this.closeNewFileTab();
+      this.setTabFocus(tab.id);
+    }
+  }
+  public closeCommunityTab() {
+    this.window.contentView.removeChildView(this.tabManager.communityTab.view);
+    this.tabManager.closeCommunityTab();
+    this.setFocusToMainTab();
+
+    this.tabManager.hasOpenedCommunityTab = false;
+    this.window.webContents.send("communityTabWasClose");
+  }
+  public openCommunity(args: WebApi.OpenCommunity) {
+    const alreadyOpen = this.tabManager.hasOpenedCommunityTab;
+    const bounds = this.calcBoundsForTabView();
+    const url = `${HOMEPAGE}${args.path}?fuid=${args.userId}`;
+
+    if (!alreadyOpen) {
+      this.tabManager.addCommunityTab();
+      this.tabManager.communityTab.userId = args.userId;
+      this.tabManager.communityTab.loadUrl(url);
+    }
+
+    // setFocusToCommunityTab() below attaches the view (once) and shows it.
+    this.tabManager.communityTab.setBounds(bounds);
+
+    this.window.webContents.send("openCommunity");
+    this.tabManager.hasOpenedCommunityTab = true;
+
+    this.setFocusToCommunityTab();
+  }
+  public updateVisibleNewProjectBtn(_: IpcMainEvent, visible: boolean) {
+    this.window.webContents.send("updateVisibleNewProjectBtn", visible);
+  }
+  public handleCallbackForTab(webContentsId: number, cbId: number, args: unknown) {
+    this.tabManager.handleCallbackForTab(webContentsId, cbId, args);
+  }
+
+  /**
+   * Hover card for a strip tab (app.tabHoverPreviews). `anchor` is the tab's
+   * rect in the panel; the card is laid out just under the strip, left-aligned
+   * with the tab. The active tab gets title/URL only — its page is on screen.
+   */
+  public showTabPreview(tabId: number, anchor: PreviewAnchor) {
+    if (!storage.settings.app.tabHoverPreviews || this.window.isDestroyed()) return;
+    const tab = this.tabManager.getAll().get(tabId);
+    if (!tab) return;
+
+    const active = this.tabManager.lastFocusedTab === tab.id;
+    // Figma's server thumbnail is shown for any file tab, active included —
+    // that is what the official app does. The screenshot is the fallback for
+    // tabs Figma sent nothing for (community, non-file pages) and is only
+    // useful for background tabs: the active one is already on screen.
+    const preview = tab.previewData;
+    const image = active ? null : (tab.thumbnail ?? null);
+    const content = this.window.getContentBounds();
+    const payload: Types.TabPreviewPayload = {
+      id: tab.id,
+      title: tab.title ?? "",
+      url: displayUrl(tab.url ?? tab.getUrl()),
+      editorType: tab.editorType,
+      isLibrary: tab.isLibrary,
+      preview,
+      image,
+      active,
+      frame: resolveFrameStyle(storage.settings.app),
+      theme: getResolvedFigmaTheme(),
+    };
+    const bounds = computeTabPreviewBounds({
+      anchor,
+      panelHeight: storage.settings.app.panelHeight || TOPPANELHEIGHT,
+      contentWidth: content.width,
+      contentHeight: content.height,
+      hasImage: !!(preview || image),
+    });
+
+    this.tabPreview ??= new TabPreviewView(this.window);
+    this.tabPreview.show(bounds, payload);
+  }
+
+  public hideTabPreview() {
+    this.tabPreview?.hide();
+  }
+
+  public pushSettingsToPanel() {
+    this.window.webContents.send("loadSettings", storage.settings);
+  }
+
+  public handleFrontReady() {
+    this.pushSettingsToPanel();
+    this.setFigmaTheme(getResolvedFigmaTheme());
+    this.showHandler(null);
+    this.revealIfHidden();
+    this.window.webContents.send("tabGroupsChanged", this.getTabGroups());
+  }
+
+  public close() {
+    // Snapshot state while tabs are still alive. tabManager.closeAll()
+    // below clears the tabs map; without this explicit call the snapshot
+    // taken by the `close` event handler would see tabs:[] and overwrite
+    // any previously persisted "saveLastOpenedTabs" payload with an empty
+    // list. The stateCached guard then makes the event-driven call a no-op.
+    this.cacheStateBeforeClose();
+
+    this.warmTabs.destroy();
+    this.modalViews.destroy();
+    this.settingsView.destroy();
+    this.tabPreview?.destroy();
+    this.tabGroupPrompt?.destroy();
+    this.tabManager.closeAll();
+    this.window.close();
+  }
+
+  private get figmaThemeBgColor(): string {
+    return getResolvedFigmaTheme() === "light" ? "#ffffff" : "#1e1e1e";
+  }
+
+  private registerEvents() {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (this.window as any).on("show", this.showHandler.bind(this));
+    this.window.on("close", (event) => {
+      // Closed by the window manager (Alt+F4, the dock): nothing awaited the
+      // flush yet. Hold the close until Settings has written its last edit.
+      if (!this.settingsFlushed) {
+        event.preventDefault();
+        void this.flushSettings().finally(() => {
+          if (!this.window.isDestroyed()) this.window.close();
+        });
+        return;
+      }
+      this.cacheStateBeforeClose();
+    });
+    this.window.on("resize", this.updateTabsBounds.bind(this));
+    this.window.on("maximize", () => setTimeout(this.updateAllTabsBounds.bind(this), 100));
+    this.window.on("unmaximize", () => setTimeout(this.updateAllTabsBounds.bind(this), 100));
+    this.window.on("move", () => setTimeout(this.updateTabsBounds.bind(this), 100));
+    this.window.on("focus", () => {
+      app.emit("windowFocus", this.window.id);
+      this.warmTabs.refreshIfStale();
+    });
+    this.window.on("blur", () => {
+      this.hideTabPreview();
+      this.hideTabGroupPrompt();
+    });
+    this.window.on("enter-full-screen", this.onEnterFullScreen.bind(this));
+    this.window.on("leave-full-screen", this.onLeaveFullScreen.bind(this));
+    this.window.webContents.on("did-finish-load", this.webContentDidFinishLoad.bind(this));
+  }
+
+  /** The tab on screen (last focused), if any. */
+  private shownTab(): Tab | MainTab | CommunityTab | undefined {
+    const id = this.tabManager.lastFocusedTab;
+    return id ? this.tabManager.getById(id) : undefined;
+  }
+
+  /**
+   * Put `next` on screen and take the current tab off it. Tab views are
+   * attached to the window once and stay attached until the tab closes;
+   * switching only toggles visibility. Detaching and re-attaching is not an
+   * option: on Wayland with Electron 44 a re-attached WebContentsView never
+   * becomes visible again — document.visibilityState stays "hidden", nothing
+   * paints and the tab shows white until a relayout — whereas setVisible
+   * round-trips reliably (verified 2026-09-07, GNOME 50; Electron 43 was fine
+   * either way). Hidden views neither paint nor occlude, so their z-order is
+   * irrelevant; overlays raise themselves on show (see TabPreviewView).
+   * The outgoing tab's hover-preview snapshot is fired before it is hidden.
+   */
+  private swapTo(next: Tab | MainTab | CommunityTab) {
+    // A Settings tab in front covers `previous`, which is already hidden —
+    // and a hidden view has nothing to capture.
+    const coveredBySettings = this.settingsTab.isShown;
+    this.settingsTab.hide();
+
+    const previous = this.shownTab();
+    if (previous && previous !== next) {
+      if (!coveredBySettings) this.captureBeforeHiding(previous);
+      previous.view.setVisible(false);
+    }
+    if (!this.window.contentView.children.includes(next.view)) {
+      this.window.contentView.addChildView(next.view);
+    }
+    next.view.setBounds(this.calcBoundsForTabView());
+    next.view.setVisible(true);
+  }
+
+  /** Hover-card snapshot of a tab about to leave the screen (see swapTo). */
+  private captureBeforeHiding(tab: Tab | MainTab | CommunityTab) {
+    if (
+      tab instanceof Tab &&
+      storage.settings.app.tabHoverPreviews &&
+      this.tabManager.getAll().has(tab.id)
+    ) {
+      void tab.captureThumbnail();
+    }
+  }
+
+  /**
+   * Back to the Figma tab that was under a closed Settings tab. Not via
+   * setFocusToMainTab: that also closes the New file tab, which is not what
+   * closing Settings means.
+   */
+  private refocusShownTab() {
+    const tab = this.shownTab();
+    if (!tab) {
+      this.setFocusToMainTab();
+      return;
+    }
+    this.swapTo(tab);
+    const id = this.tabManager.lastFocusedTab;
+    const isMain = id === this.tabManager.mainTab.id;
+    const isCommunity = !!this.tabManager.communityTab && id === this.tabManager.communityTab.id;
+    this.window.webContents.send(
+      "focusTab",
+      isMain ? "mainTab" : isCommunity ? "communityTab" : id,
+    );
+    app.emit("needUpdateMenu", this.id, isMain ? null : (id ?? null), { "close-tab": !isMain });
+  }
+
+  /**
+   * Put a tab view into the window's view tree without showing it. Every tab
+   * view is attached the moment it exists — before its page loads — and only
+   * ever toggled with setVisible afterwards (see swapTo).
+   */
+  private attachHidden(view: Tab["view"]) {
+    view.setVisible(false);
+    view.setBounds(this.calcBoundsForTabView());
+    if (!this.window.contentView.children.includes(view)) {
+      this.window.contentView.addChildView(view);
+    }
+  }
+}

@@ -1,0 +1,69 @@
+{
+  "extends": "@tsconfig/svelte/tsconfig.json",
+  "compilerOptions": {
+    "outDir": "../../dist",
+    "rootDir": "..",
+    "useUnknownInCatchVariables": false,
+    "allowArbitraryExtensions": true,
+    "noImplicitAny": true,
+    "allowJs": false,
+    "target": "ES2022",
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "sourceMap": true,
+    "preserveConstEnums": true,
+    "removeComments": true,
+    "emitDecoratorMetadata": true,
+    "experimentalDecorators": true,
+    "allowSyntheticDefaultImports": true,
+    "esModuleInterop": true,
+    "resolveJsonModule": true,
+    "isolatedModules": true,
+    "skipLibCheck": true,
+    "strictPropertyInitialization": false,
+    "noImplicitThis": false,
+    "allowUnusedLabels": true,
+    "noUnusedLocals": false,
+    "strictNullChecks": false,
+    "lib": [
+      "DOM",
+      "DOM.Iterable",
+      "ES2022"
+    ],
+    "typeRoots": [
+      "../../node_modules/@types",
+      "types/**/*"
+    ],
+    "paths": {
+      "Icons": ["../renderer/Common/Icons"],
+      "Icons/*": ["../renderer/Common/Icons/*"],
+      "Common": ["../renderer/Common"],
+      "Common/*": ["../renderer/Common/*"],
+      "Containers": ["../renderer/Common/Containers"],
+      "Containers/*": ["../renderer/Common/Containers/*"],
+      "DesktopAPI": ["./DesktopAPI"],
+      "DesktopAPI/*": ["./DesktopAPI/*"],
+      "Const": ["../constants"],
+      "Utils": ["../utils"],
+      "Utils/*": ["../utils/*"],
+      "Enums": ["../types/enums.ts"],
+      "Types": ["../types"],
+      "Types/*": ["../types/*"],
+      "*": ["../../node_modules/@types/*"]
+    }
+  },
+  "include": [
+    "../constants/**/*",
+    "../renderer/**/*",
+    "../types/**/*",
+    "../utils/Main/fs.ts",
+    "../utils/Common/*",
+    "../utils/Render/*",
+    "**/*",
+    "../../node_modules/svelte/svelte-html.d.ts"
+  ],
+  "exclude": [
+    "../../node_modules",
+    "../../dist"
+  ]
+}

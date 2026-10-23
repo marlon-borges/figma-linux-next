@@ -1,0 +1,207 @@
+import {
+  app,
+  shell,
+  WebContentsView,
+  type WebContentsViewConstructorOptions,
+  type Rectangle,
+  type BrowserWindow,
+  type DidCreateWindowDetails,
+  type Event,
+  type HandlerDetails,
+} from "electron";
+
+import { LOGIN_PAGE, RECENT_FILES } from "Const";
+import {
+  preloadMainScriptPathDev,
+  preloadMainScriptPathProd,
+  toggleDetachedDevTools,
+} from "Utils/Main";
+import {
+  isDev,
+  isFigmaRunUrl,
+  isFileBrowserUrl,
+  isAppAuthRedeem,
+  isFigmaDocLink,
+  isFigmaBoardLink,
+  isFigmaDesignLink,
+  isExternallyOpenableUrl,
+  parseURL,
+} from "Utils/Common";
+import { storage } from "Main/Storage";
+import { logger } from "Main/Logger";
+
+export default class MainTab {
+  private _userId: string;
+  private options: WebContentsViewConstructorOptions = {
+    webPreferences: {
+      nodeIntegration: false,
+      webgl: true,
+      contextIsolation: false,
+      zoomFactor: 1,
+      preload: isDev ? preloadMainScriptPathDev : preloadMainScriptPathProd,
+    },
+  };
+
+  public id: number;
+  public view: WebContentsView;
+
+  constructor(private windowId: number) {
+    this.initTab();
+    this.registerEvents();
+  }
+
+  public setUserId(id: string) {
+    if (this._userId !== id) {
+      const url = `${RECENT_FILES}/?fuid=${id}`;
+      this.loadUrl(url);
+    }
+
+    this._userId = id;
+  }
+  public loadUrl(url: string) {
+    this.view.webContents.loadURL(url);
+  }
+  public getUrl() {
+    return this.view.webContents.getURL();
+  }
+  public loadLoginPage() {
+    this.view.webContents.loadURL(LOGIN_PAGE);
+  }
+  public handleUrl(path: string) {
+    this.view.webContents.send("handleUrl", path);
+  }
+  public setBounds(bounds: Rectangle) {
+    this.view.setBounds(bounds);
+  }
+
+  private initTab() {
+    this._userId = storage.settings.userId;
+    const url = `${RECENT_FILES}/?fuid=${this._userId}`;
+
+    this.view = new WebContentsView(this.options);
+    this.id = this.view.webContents.id;
+
+    this.loadUrl(url);
+
+    if (isDev) toggleDetachedDevTools(this.view.webContents);
+
+    app.emit("requestBoundsForTabView", this.windowId);
+  }
+
+  public updateScale(scale: number) {
+    this.view.webContents.setZoomFactor(scale);
+  }
+  private onMainTabWillNavigate(event: Event, url: string) {
+    if (isFigmaRunUrl(url) && !isFileBrowserUrl(url)) {
+      app.emit("openUrlInNewTab", url);
+
+      event.preventDefault();
+    }
+  }
+  private onDomReady(_event: Event) {}
+  private onMainWindowWillNavigate(event: Event & { sender?: Electron.WebContents }, url: string) {
+    if (event?.sender) {
+      const currentUrl = event.sender.getURL();
+      if (isAppAuthRedeem(url)) {
+        return;
+      }
+
+      if (url === currentUrl) {
+        event.preventDefault();
+        return;
+      }
+
+      const from = parseURL(currentUrl);
+      const to = parseURL(url);
+
+      if (from?.pathname === "/login") {
+        event.preventDefault();
+        return;
+      }
+
+      if (to?.pathname === "/logout") {
+        app.emit("signOut");
+      }
+
+      if (to?.search?.match(/[?&]redirected=1/)) {
+        event.preventDefault();
+        return;
+      }
+    }
+
+    if (isFigmaDocLink(url)) {
+      shell.openExternal(url);
+      event.preventDefault();
+      return;
+    }
+    if (isFigmaBoardLink(url) || isFigmaDesignLink(url)) {
+      app.emit("openUrlInNewTab", url);
+      event.preventDefault();
+      return;
+    }
+  }
+  private onNewWindow(window: BrowserWindow, details: DidCreateWindowDetails) {
+    const { url } = details;
+    logger.debug("newWindow, url: ", url);
+
+    if (/start_google_sso/.test(url)) return;
+
+    if (isFileBrowserUrl(url)) {
+      window.close();
+      this.view.webContents.loadURL(url);
+      return;
+    }
+
+    if (isFigmaRunUrl(url)) {
+      if (isFigmaBoardLink(url) || isFigmaDesignLink(url)) {
+        window.destroy();
+      }
+      app.emit("openUrlInNewTab", url);
+      return;
+    }
+
+    if (isExternallyOpenableUrl(url)) {
+      shell.openExternal(url);
+    }
+  }
+
+  private windowOpenHandler(details: HandlerDetails) {
+    const { url } = details;
+
+    logger.debug(
+      `[MainTab] window.open url="${url}" frameName="${details.frameName}" disposition="${details.disposition}" features="${details.features}"`,
+    );
+
+    if (url.startsWith("https://accounts.google.com/") && /start_google_sso/.test(url)) {
+      return { action: "allow" as const };
+    }
+
+    if (isFileBrowserUrl(url)) {
+      // Team/project/recent browsing — navigate within the main tab, not a new tab
+      this.view.webContents.loadURL(url);
+      return { action: "deny" as const };
+    }
+
+    if (isFigmaRunUrl(url)) {
+      app.emit("openUrlInNewTab", url);
+    } else if (isExternallyOpenableUrl(url)) {
+      shell.openExternal(url);
+    } else {
+      logger.warn(`[MainTab] window.open blocked, unsupported scheme: ${url}`);
+    }
+
+    return { action: "deny" as const };
+  }
+
+  private registerEvents() {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (this.view.webContents as any).setWindowOpenHandler(this.windowOpenHandler.bind(this));
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (this.view.webContents as any).on("will-navigate", this.onMainTabWillNavigate.bind(this));
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (this.view.webContents as any).on("will-navigate", this.onMainWindowWillNavigate.bind(this));
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (this.view.webContents as any).on("dom-ready", this.onDomReady.bind(this));
+    this.view.webContents.on("did-create-window", this.onNewWindow.bind(this));
+  }
+}

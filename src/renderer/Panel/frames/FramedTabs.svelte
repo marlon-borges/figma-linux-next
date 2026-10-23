@@ -1,0 +1,488 @@
+<script lang="ts">
+  import { getFrameConfig } from "Utils/Render/frameTheme";
+  import { NEW_FILE_TAB_TITLE } from "../../../constants/other";
+  import List from "../Components/List.svelte";
+  import { tabSlide } from "../Components/motion";
+  import { closeTab, newFileTabOrder, tabFocus } from "../Components/utils";
+  import { applyDropOrder } from "Utils/Common";
+  import { currentTab, layout, newFileVisible, settingsTabOpen, tabGroups, tabs } from "../store";
+  import NewTabButton from "./NewTabButton.svelte";
+  import SettingsStripTab from "./SettingsStripTab.svelte";
+
+  let { style }: { style: Types.FrameStyle } = $props();
+
+  const cfg = $derived(getFrameConfig(style));
+  // Class prefix: gnome -> "g", kde -> "k", everything else -> "w". All class
+  // families are defined below; only the active one is emitted, so they never collide.
+  const p = $derived(style === "gnome" ? "g" : style === "kde" ? "k" : "w");
+
+  let currentTabId = $state<number | undefined>();
+  let item: HTMLDivElement;
+
+  function wheelHandler(e: WheelEvent) {
+    if (e.deltaY > 0) item.scrollLeft += 50;
+    else item.scrollLeft -= 50;
+  }
+
+  function dblclickHandler(e: MouseEvent) {
+    window.figmaApi.send("windowMaximize");
+    e.preventDefault();
+    e.stopImmediatePropagation();
+    e.stopPropagation();
+  }
+
+  function onClickTitle(event: MouseEvent, id: number) {
+    switch (event.button) {
+      case 0:
+        tabFocus(id);
+        break;
+      case 1:
+        closeTab(id);
+        break;
+      // Right button: List's oncontextmenu opens the tab menu. Opening it here
+      // on mouseup too could pop a second menu.
+    }
+  }
+
+  function onClickClose(event: MouseEvent, id: number) {
+    if (event && event.button !== undefined && event.button !== 0) return;
+    closeTab(id);
+  }
+
+  // The strip was reordered by drag. Renumber `order` from the new visual
+  // sequence (New file stays pinned first or last, see newFileTabOrder) and
+  // push it to the main process so
+  // the tab Map — and thus Ctrl+(Shift+)Tab cycling — follows the visual order
+  // immediately, not only on window close.
+  function onReorder(orderedIds: number[], groupAssignments?: Map<number, string | undefined>) {
+    // applyDropOrder rebuilds the list *in the dropped sequence* — the array
+    // order is what the strip renders, so rebuilding it from the old one and
+    // relying on the `order` field would throw the reorder away (see the note
+    // on applyDropOrder). Collapsed-group members it never saw are folded back
+    // in beside their group.
+    //
+    // The sort puts an ungrouped New file tab back at its pinned end: dropped
+    // anywhere else, its `order` would still say first/last, and the next
+    // addTab (which sorts by order) would make it jump there unprompted.
+    const next = applyDropOrder(tabs.value, orderedIds, groupAssignments)
+      .map((tab, index) => ({
+        ...tab,
+        order: tab.title === NEW_FILE_TAB_TITLE && !tab.groupId ? newFileTabOrder() : index + 1,
+      }))
+      .sort((a, b) => a.order - b.order);
+
+    // Emptied groups are NOT pruned here. Main owns that decision
+    // (Window.sortTabs → pruneEmptyGroup, which also remembers the group so
+    // reopening its last tab restores it) and answers with `tabGroupsChanged`.
+    tabs.set(next);
+    window.figmaApi.send("reorderTabs", $state.snapshot(next));
+  }
+
+  function onToggleGroupCollapse(groupId: string) {
+    const group = tabGroups.getGroup(groupId);
+    if (!group) return;
+    const collapsed = !group.collapsed;
+    tabGroups.setCollapsedLocal(groupId, collapsed);
+    window.figmaApi.send("setTabGroupCollapsed", { groupId, collapsed });
+  }
+
+  function onContextMenuGroup(e: MouseEvent, groupId: string) {
+    e.preventDefault();
+    e.stopPropagation();
+    window.figmaApi.send("openTabGroupMenu", groupId);
+  }
+
+  $effect(() => {
+    const id = currentTab.value;
+    currentTabId = typeof id === "number" ? id : undefined;
+  });
+</script>
+
+<div
+  role="tablist"
+  tabindex="0"
+  class="tabs"
+  bind:this={item}
+  onwheel={wheelHandler}
+  ondblclick={dblclickHandler}
+>
+  <List
+    items={tabs.value}
+    groups={tabGroups.value}
+    {currentTabId}
+    frameStyle={style}
+    closeIcon={cfg.tabs.closeIcon.component}
+    closeIconSize={cfg.tabs.closeIcon.size}
+    showDividers={cfg.tabs.showDividers}
+    tabClass="{p}-tab"
+    tabWrapperClass="{p}-tab-wrapper"
+    dividerClass="{p}-divider"
+    dividerNearActiveClass="{p}-divider--near-active"
+    tabActiveClass="{p}-tab--active"
+    tabTextClass="{p}-tab-text"
+    tabCloseClass="{p}-tab-close"
+    {onClickTitle}
+    {onClickClose}
+    {onReorder}
+    {onToggleGroupCollapse}
+    {onContextMenuGroup}
+    onActivate={tabFocus}
+  />
+  {#if settingsTabOpen.value}
+    <SettingsStripTab {style} />
+  {/if}
+  {#if layout.newTabAfterTabs && newFileVisible.value}
+    <span class="strip-plus" transition:tabSlide>
+      <NewTabButton {style} />
+    </span>
+  {/if}
+</div>
+
+<style>
+  /* Shared container; frame-specific gap/color/padding are scoped by data-frame
+     so the class stays just `.tabs` (no per-frame element class). */
+  .tabs {
+    display: flex;
+    flex-grow: 1;
+    align-items: center;
+    flex-flow: row;
+    width: 100%;
+    scrollbar-width: none;
+    overflow-x: scroll;
+    outline: none !important;
+    -webkit-app-region: drag;
+  }
+  .tabs:focus-visible {
+    outline: none !important;
+  }
+  .tabs::-webkit-scrollbar {
+    display: none;
+  }
+  /* Set by tabReorder for the duration of a drag, and only while the tabs fit
+     without scrolling — otherwise the lifted tab and its shadow are clipped by
+     this element's own overflow. See unclipStrip() in tabReorder.ts. */
+  /* :global on the class alone — it is added from JS, so Svelte would
+     otherwise prune this rule as unused. */
+  .tabs:global(.tabs-dragging) {
+    overflow: visible;
+  }
+  /* `position: sticky` resolves against the nearest scroll container, which is
+     `.tabs` itself. Dropping its overflow above re-anchors the "+" to an
+     ancestor further up, and it jumps — landing on top of the tab being
+     dragged. Park it in normal flow for the duration: unclipping only happens
+     while the tabs fit without scrolling (see unclipStrip in tabReorder.ts),
+     and with nothing to scroll, sticky was holding it exactly where static
+     does. Also keep it under the lifted tab, which carries z-index 25. */
+  .tabs:global(.tabs-dragging) .strip-plus {
+    position: static;
+    z-index: 0;
+  }
+  /* "+" after the last tab (app.newTabButtonAfterTabs). It flows right after the
+     strip while there is room and sticks to the strip's right edge once the tabs
+     overflow, so it never scrolls out of reach — Firefox's behaviour. The panel
+     background under it hides the tab it then covers. */
+  .strip-plus {
+    position: sticky;
+    right: 0;
+    z-index: 1;
+    display: flex;
+    align-items: center;
+    align-self: stretch;
+    flex-shrink: 0;
+    padding-left: 4px;
+    background: var(--frame-bg);
+    -webkit-app-region: no-drag;
+  }
+  :global([data-frame="windows"]) .strip-plus {
+    padding-left: 0;
+  }
+
+  :global([data-frame="gnome"]) .tabs {
+    gap: 2px;
+    color: var(--frame-fg-muted);
+    padding: 0;
+  }
+  :global([data-frame="kde"]) .tabs {
+    gap: 0;
+    color: var(--frame-fg-muted);
+    padding: 0 4px;
+    align-self: stretch;
+  }
+  :global([data-frame="windows"]) .tabs {
+    gap: 0px;
+    color: var(--fg-tab, rgba(255, 255, 255, 0.8));
+    padding: 0 16px;
+  }
+
+  /* ── Gnome tab styles — classes are on the elements themselves so they
+     survive DnD ghost cloning ─────────────────────────────────────────── */
+  :global(.g-tab-wrapper) {
+    display: flex;
+    align-items: center;
+    gap: 2px;
+  }
+
+  :global(.g-divider) {
+    width: 1px;
+    height: 28px;
+    background-color: var(--frame-divider);
+    flex-shrink: 0;
+    transition: background-color var(--motion-hover) var(--motion-ease-hover);
+  }
+  :global(.g-divider--near-active) {
+    background-color: transparent;
+  }
+
+  :global(.g-tab) {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    margin: 0;
+    padding-right: 5px;
+    border-radius: 8px;
+    background-color: transparent;
+    border: none;
+    height: 34px;
+    transition: background-color var(--motion-hover) var(--motion-ease-hover);
+    outline: none !important;
+    -webkit-app-region: no-drag;
+    box-sizing: border-box;
+  }
+  :global(.g-tab:hover) {
+    background-color: var(--frame-tab-hover);
+  }
+  :global(.g-tab--active) {
+    background-color: var(--frame-tab-active);
+  }
+
+  :global(.g-tab-text) {
+    display: flex;
+    flex: 1;
+    align-self: stretch;
+    min-width: 60px;
+    max-width: 200px;
+    align-items: center;
+    gap: 6px;
+    user-select: none;
+    cursor: pointer;
+    padding: 0 0 0 10px;
+    color: var(--frame-fg-muted);
+    font-size: var(--text-size-tab, 13px);
+    font-weight: 600;
+    outline: none !important;
+  }
+  :global(.g-tab-text > svg) {
+    flex-shrink: 0;
+  }
+  :global(.g-tab-text:focus-visible) {
+    outline: none !important;
+  }
+  :global(.g-tab-text span) {
+    display: inline;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  :global(.g-tab:hover .g-tab-text span) {
+    color: var(--frame-fg);
+  }
+  :global(.g-tab--active .g-tab-text span) {
+    color: var(--frame-fg);
+  }
+
+  :global(.g-tab div[role="button"]:not(.g-tab-text)) {
+    background-color: transparent;
+    border-radius: 20px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 0;
+    opacity: 0;
+    transition:
+      opacity var(--motion-hover) var(--motion-ease-hover),
+      background-color var(--motion-hover) var(--motion-ease-hover);
+  }
+  :global(.g-tab:hover div[role="button"]:not(.g-tab-text)) {
+    opacity: 1;
+  }
+  :global(.g-tab--active div[role="button"]:not(.g-tab-text)) {
+    opacity: 1;
+  }
+  :global(.g-tab div[role="button"]:not(.g-tab-text):hover) {
+    background-color: var(--frame-btn-hover);
+  }
+
+  /* ── KDE / Breeze tab styles — like Dolphin/Konsole: the active tab takes the
+     view background and an accent line on top, the rest stay flat ────────── */
+  :global(.k-tab-wrapper) {
+    display: flex;
+    align-items: stretch;
+    align-self: stretch;
+    gap: 0;
+  }
+
+  :global(.k-tab) {
+    position: relative;
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    margin: 0;
+    padding-right: 4px;
+    border-radius: 0; /* Breeze tabs are square; a 3px corner showed on hover */
+    background-color: transparent;
+    border: none;
+    height: 40px;
+    transition: background-color var(--motion-hover) var(--motion-ease-hover);
+    outline: none !important;
+    -webkit-app-region: no-drag;
+    box-sizing: border-box;
+  }
+  :global(.k-tab:hover) {
+    background-color: var(--frame-tab-hover);
+  }
+  :global(.k-tab--active),
+  :global(.k-tab--active:hover) {
+    background-color: var(--frame-tab-active);
+  }
+  :global(.k-tab--active::before) {
+    content: "";
+    position: absolute;
+    left: 0;
+    right: 0;
+    top: 0;
+    height: 2px;
+    background-color: var(--frame-accent);
+  }
+
+  :global(.k-tab-text) {
+    display: flex;
+    flex: 1;
+    align-self: stretch;
+    min-width: 60px;
+    max-width: 200px;
+    align-items: center;
+    gap: 6px;
+    user-select: none;
+    cursor: pointer;
+    padding: 0 0 0 10px;
+    color: var(--frame-fg-muted);
+    font-size: var(--text-size-tab, 14px);
+    outline: none !important;
+  }
+  :global(.k-tab-text > svg) {
+    flex-shrink: 0;
+  }
+  :global(.k-tab-text:focus-visible) {
+    outline: none !important;
+  }
+  :global(.k-tab-text span) {
+    display: inline;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  :global(.k-tab:hover .k-tab-text span),
+  :global(.k-tab--active .k-tab-text span) {
+    color: var(--frame-fg);
+  }
+
+  /* Close: hidden until hover/active, round halo like the window controls */
+  :global(.k-tab div[role="button"]:not(.k-tab-text)) {
+    background-color: transparent;
+    border-radius: 50%;
+    width: 22px;
+    height: 22px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 0;
+    opacity: 0;
+    transition:
+      opacity var(--motion-hover) var(--motion-ease-hover),
+      background-color var(--motion-hover) var(--motion-ease-hover);
+  }
+  :global(.k-tab:hover div[role="button"]:not(.k-tab-text)),
+  :global(.k-tab--active div[role="button"]:not(.k-tab-text)) {
+    opacity: 1;
+  }
+  :global(.k-tab div[role="button"]:not(.k-tab-text):hover) {
+    background-color: var(--frame-btn-hover);
+  }
+
+  /* ── Windows tab styles ─────────────────────────────────────────────── */
+  :global(.w-tab-wrapper) {
+    display: flex;
+    align-items: center;
+    gap: 0px;
+  }
+
+  :global(.w-tab) {
+    display: flex;
+    align-items: center;
+    margin: 0;
+    border-radius: 0px;
+    background-color: var(--bg-tab, transparent);
+    border: none;
+    /* 1px separator on the right, like Figma's Windows tab strip */
+    box-shadow: inset -1px 0 0 var(--frame-divider);
+    height: 40px;
+    transition: background-color var(--motion-hover) var(--motion-ease-hover);
+    outline: none !important;
+    -webkit-app-region: no-drag;
+    box-sizing: border-box;
+  }
+  :global(.w-tab:hover) {
+    background-color: var(--bg-tab-hover, rgba(255, 255, 255, 0.08));
+  }
+  :global(.w-tab--active) {
+    background-color: var(--bg-tab-active, rgba(255, 255, 255, 0.08));
+    box-shadow: none;
+  }
+  :global(.w-tab--active .w-tab-text) {
+    font-weight: 600;
+  }
+
+  :global(.w-tab-text) {
+    display: flex;
+    flex: 1;
+    align-self: stretch;
+    min-width: 60px;
+    max-width: 200px;
+    align-items: center;
+    gap: 6px;
+    user-select: none;
+    cursor: pointer;
+    padding: 0 0 0 10px;
+    color: var(--fg-tab, rgba(255, 255, 255, 0.8));
+    font-size: var(--text-size-tab, 14px);
+    outline: none !important;
+  }
+  :global(.w-tab-text > svg) {
+    flex-shrink: 0;
+  }
+  :global(.w-tab-text:focus-visible) {
+    outline: none !important;
+  }
+  :global(.w-tab-text span) {
+    display: inline;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  :global(.w-tab:hover .w-tab-text span) {
+    color: var(--fg-tab-hover, rgba(255, 255, 255, 1));
+  }
+  :global(.w-tab--active .w-tab-text span) {
+    color: var(--fg-tab-hover, rgba(255, 255, 255, 1));
+  }
+
+  :global(.w-tab div[role="button"]) {
+    background-color: transparent;
+    border-radius: 0px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 0 7px;
+    opacity: 1;
+  }
+</style>

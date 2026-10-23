@@ -1,0 +1,71 @@
+{
+  "compilerOptions": {
+    "outDir": "./dist",
+    "useUnknownInCatchVariables": false,
+    "allowArbitraryExtensions": true,
+    "noImplicitAny": true,
+    "allowJs": false,
+    "target": "ES2022",
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "sourceMap": true,
+    "preserveConstEnums": true,
+    "removeComments": true,
+    "emitDecoratorMetadata": true,
+    "experimentalDecorators": true,
+    "allowSyntheticDefaultImports": true,
+    "esModuleInterop": true,
+    "resolveJsonModule": true,
+    "isolatedModules": true,
+    "skipLibCheck": true,
+    "strictPropertyInitialization": false,
+    "noImplicitThis": false,
+    "allowUnusedLabels": true,
+    "noUnusedLocals": false,
+    "strictNullChecks": false,
+    "lib": [
+      "DOM",
+      "DOM.Iterable",
+      "ES2022"
+    ],
+    "typeRoots": [
+      "node_modules/@types",
+      "src/types"
+    ],
+    "types": [
+      "node",
+      "bun",
+      "fontkit"
+    ],
+    "paths": {
+      "Main": ["./src/main"],
+      "Main/*": ["./src/main/*"],
+      "Icons": ["./src/renderer/Common/Icons"],
+      "Icons/*": ["./src/renderer/Common/Icons/*"],
+      "Common": ["./src/renderer/Common"],
+      "Common/*": ["./src/renderer/Common/*"],
+      "Containers": ["./src/renderer/Common/Containers"],
+      "Containers/*": ["./src/renderer/Common/Containers/*"],
+      "DesktopAPI": ["./src/renderer/DesktopAPI"],
+      "DesktopAPI/*": ["./src/renderer/DesktopAPI/*"],
+      "Const": ["./src/constants"],
+      "Const/*": ["./src/constants/*"],
+      "Utils": ["./src/utils"],
+      "Utils/*": ["./src/utils/*"],
+      "Enums": ["./src/types/enums.ts"],
+      "Storage": ["./src/main/Storage.ts"],
+      "Types": ["./src/types"],
+      "Types/*": ["./src/types/*"],
+      "*": ["./node_modules/@types/*"]
+    }
+  },
+  "include": [
+    "src/constants/**/*",
+    "src/main/**/*",
+    "src/types/**/*",
+    "src/utils/**/*",
+    "src/renderer/**/*",
+    "tests/**/*",
+    "scripts/**/*.ts"
+  ]
+}

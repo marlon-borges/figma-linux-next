@@ -1,0 +1,637 @@
+/**
+ * ToolHandlers.ts — implementations of the MCP tools.
+ *
+ * One method per tool, plus the screenshot helpers and the exec() chokepoint.
+ * Extracted verbatim from McpServer.ts (Phase 7 of decomposition); the only
+ * change is that shared state (Figma view, logger, code-connect map, asset
+ * store) is injected via ToolContext instead of read off `this`. The JSON-RPC
+ * dispatcher in McpServer delegates here. No behavior change.
+ */
+
+import crypto from "node:crypto";
+import fs from "node:fs";
+import path from "node:path";
+import { MCP_HOST } from "../config";
+import {
+  CREATE_PAGE_SCRIPT,
+  DESIGN_CONTEXT_SCRIPT,
+  DESIGN_SYSTEM_RULES_SCRIPT,
+  FIGJAM_SCRIPT,
+  FILE_INFO_SCRIPT,
+  FIND_NODES_SCRIPT,
+  GENERATE_DIAGRAM_SCRIPT,
+  METADATA_XML_SCRIPT,
+  SCREENSHOT_SCRIPT,
+  SEARCH_DESIGN_SYSTEM_SCRIPT,
+  SET_TEXT_SCRIPT,
+  TREE_SCRIPT,
+  USE_FIGMA_SCRIPT,
+  VARIABLE_DEFS_SCRIPT,
+} from "../scripts";
+import type { AssetEntry, CodeConnectEntry, FigmaViewProvider, Logger } from "../types";
+import { parseMermaid } from "../utils/mermaid";
+import { normalizeNodeId } from "../utils/nodeId";
+import { assertSafePngTarget } from "../utils/savePath";
+import { safeStringify } from "../utils/serialize";
+import { appendLogs, toolError, toolResult } from "../utils/toolResponse";
+
+/** Shared state the tool handlers operate on, injected by McpServer. */
+export interface ToolContext {
+  /** Active Figma view (guaranteed non-null: McpServer guards before dispatch). */
+  viewProvider: FigmaViewProvider;
+  log: Logger;
+  codeConnectMap: Map<string, CodeConnectEntry>;
+  assetStore: Map<string, AssetEntry>;
+  /** The port the MCP server is actually bound to (may differ from the default). */
+  getPort: () => number;
+  /**
+   * Base directory for a relative `savePath`.
+   *
+   * Never `process.cwd()`: in a packaged app that is wherever the launcher
+   * happened to start the process (often `/`), which has nothing to do with the
+   * MCP client's working directory. A relative path used to be resolved against
+   * it, so the write succeeded and reported an accurate absolute `savedTo` —
+   * just nowhere near where the caller was looking. Defaults to the app's
+   * configured export directory.
+   */
+  getSaveBaseDir: () => string;
+  /** How long a script in the page may take before the tool gives up. Tests shorten it. */
+  scriptTimeoutMs?: number;
+}
+
+export class ToolHandlers {
+  constructor(private ctx: ToolContext) {}
+
+  /**
+   * Run a script in the active Figma tab. Single chokepoint for view access.
+   *
+   * Bounded: a call Figma never answers (a raster exportAsync that stalled was
+   * seen live) used to hang the tool, and the MCP client with it, for good.
+   * executeJavaScript cannot be cancelled, so the script may still finish in
+   * the page; the caller just stops waiting and gets an error it can act on.
+   */
+  private async exec(script: string): Promise<any> {
+    const ms = this.ctx.scriptTimeoutMs ?? 60_000;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timeout = new Promise<never>((_, reject) => {
+      timer = setTimeout(
+        () =>
+          reject(
+            new Error(
+              `Figma did not answer within ${Math.round(ms / 1000)} s. ` +
+                "The tab may still be loading or busy; retry, or switch to the tab in the app first.",
+            ),
+          ),
+        ms,
+      );
+    });
+    try {
+      return await Promise.race([this.ctx.viewProvider.executeInBrowserView(script), timeout]);
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  /**
+   * Run a script with a print()/logs channel. The script (a self-contained IIFE
+   * expression) is inlined into a wrapper that exposes a `print(...)` function in
+   * its lexical scope and captures emitted lines into `__logs`. The wrapper
+   * preserves the promise path (some scripts return a Promise) and always
+   * resolves to a structured-clone-safe `{__logs, __result}`.
+   *
+   * Backward-compatible: scripts that never call print() simply return empty
+   * logs. Only the new tools use this path; the 11 existing tools keep exec().
+   */
+  private async execWithLogs(script: string): Promise<{ result: any; logs: string[] }> {
+    const wrapped = `
+(function () {
+  var __logs = [];
+  var print = function () {
+    try { __logs.push(Array.prototype.map.call(arguments, function (a) {
+      return (typeof a === 'string') ? a : JSON.stringify(a); }).join(' ')); }
+    catch (e) { __logs.push(String(arguments[0])); }
+  };
+  var __r;
+  try { __r = (${script}); }
+  catch (e) { return { __logs: __logs, __result: { error: e.message || String(e) } }; }
+  if (__r && typeof __r.then === 'function') {
+    return __r.then(function (v) { return { __logs: __logs, __result: v }; })
+              .catch(function (e) { return { __logs: __logs, __result: { error: e.message || String(e) } }; });
+  }
+  return { __logs: __logs, __result: __r };
+})()`;
+
+    const raw = await this.exec(wrapped);
+    let obj: any;
+    try {
+      obj = typeof raw === "string" ? JSON.parse(raw) : raw;
+    } catch (err) {
+      this.ctx.log.error("Failed to parse execWithLogs result:", err);
+      obj = null;
+    }
+    return {
+      result: obj?.__result,
+      logs: Array.isArray(obj?.__logs) ? obj.__logs : [],
+    };
+  }
+
+  // ── Tool: get_design_context ─────────────────────────────────────────────
+
+  public async toolGetDesignContext(args: Record<string, unknown>) {
+    const nodeId = normalizeNodeId(args.nodeId);
+    const depth = typeof args.depth === "number" ? args.depth : 10;
+
+    const script = DESIGN_CONTEXT_SCRIPT(nodeId, depth);
+    const raw = await this.exec(script);
+
+    // Script returns a JSON string to avoid V8 structured-clone failures over IPC
+    let result: any;
+    try {
+      result = typeof raw === "string" ? JSON.parse(raw) : raw;
+    } catch {
+      return toolError(
+        "Failed to deserialize design context — the Figma scene graph may contain non-serializable objects",
+      );
+    }
+
+    if (result?.error) {
+      return toolError(result.error);
+    }
+
+    const json = JSON.stringify(result, null, 2);
+    const approxTokens = Math.round(json.length / 4);
+    const WARNING_TOKENS = 8_000;
+
+    if (approxTokens > WARNING_TOKENS) {
+      const warn =
+        `⚠ Large response (~${(approxTokens / 1000).toFixed(1)}k tokens). ` +
+        `This may fill context quickly. Consider re-calling with a more specific nodeId or a smaller depth.\n\n`;
+      return toolResult(warn + json);
+    }
+
+    return toolResult(json);
+  }
+
+  // ── Tool: get_metadata ───────────────────────────────────────────────────
+
+  public async toolGetMetadata(args: Record<string, unknown>) {
+    const nodeId = normalizeNodeId(args.nodeId);
+    const depth = typeof args.depth === "number" ? args.depth : 8;
+
+    const script = METADATA_XML_SCRIPT(nodeId, depth);
+    const raw = await this.exec(script);
+
+    let result: any;
+    try {
+      result = typeof raw === "string" ? JSON.parse(raw) : raw;
+    } catch {
+      return toolError("Failed to deserialize metadata response");
+    }
+
+    if (result?.error) {
+      return toolError(result.error);
+    }
+
+    return toolResult(result.xml ?? "");
+  }
+
+  // ── Tool: get_file_info ──────────────────────────────────────────────────
+
+  public async toolGetFileInfo() {
+    const result = await this.exec(FILE_INFO_SCRIPT);
+
+    if (result?.error) {
+      return toolError(result.error);
+    }
+
+    return toolResult(safeStringify(result));
+  }
+
+  // ── Tool: get_screenshot ─────────────────────────────────────────────────
+
+  public async toolGetScreenshot(args: Record<string, unknown>) {
+    const nodeId = normalizeNodeId(args.nodeId);
+    const scale = typeof args.scale === "number" ? Math.min(4, Math.max(0.5, args.scale)) : 2;
+    const savePath = args.savePath ? String(args.savePath) : null;
+
+    // Try Plugin API exportAsync first
+    const script = SCREENSHOT_SCRIPT(nodeId, scale);
+    const result = await this.exec(script);
+
+    if (result?.error) {
+      this.ctx.log.warn("Plugin API export failed:", result.error);
+
+      // The capturePage fallback grabs the whole editor window: canvas, layers
+      // panel, toolbar and all. That is a reasonable stand-in for "screenshot
+      // what I'm looking at", and no substitute whatsoever for "export node X"
+      // — it ignores `scale` and returns the same image for every node asked
+      // for. Returning it as a success turned a batch of node exports into a
+      // pile of byte-identical window captures that all reported `savedTo`.
+      if (nodeId) {
+        return toolError(
+          `Could not export node ${nodeId}: ${result.error}. ` +
+            "Screenshot not saved. Retry once the file is fully loaded, or call " +
+            "get_screenshot without a nodeId to capture the visible window instead.",
+        );
+      }
+
+      this.ctx.log.warn("Falling back to capturePage for the visible window");
+      return this.capturePageFallback(
+        savePath,
+        result.noSelection
+          ? "Nothing is selected, so this is a capture of the whole window, not a node export. Select a node or pass a nodeId to export it. `scale` was not applied."
+          : `${result.error}. This is a capture of the whole window, not a node export. \`scale\` was not applied.`,
+      );
+    }
+
+    if (result?.base64) {
+      return this.buildScreenshotResponse(result.base64, result.nodeId, result.nodeName, savePath);
+    }
+
+    return toolError("Screenshot export returned no data");
+  }
+
+  /** Build an MCP response with the image inline + optional disk save. */
+  private async buildScreenshotResponse(
+    base64: string,
+    nodeId: string,
+    nodeName: string,
+    savePath: string | null,
+    extraMeta?: Record<string, unknown>,
+  ) {
+    type ContentItem = { type: string; data?: string; mimeType?: string; text?: string };
+    const content: ContentItem[] = [{ type: "image", data: base64, mimeType: "image/png" }];
+
+    const meta: Record<string, unknown> = { nodeId, nodeName, ...extraMeta };
+
+    if (savePath) {
+      // Resolving can throw too (app.getPath), so it sits inside the try: a
+      // failure there is a saveError, not a failed tool call.
+      let absPath = savePath;
+      try {
+        absPath = this.resolveSavePath(savePath);
+        if (!path.isAbsolute(savePath)) {
+          // Say so explicitly: the caller's idea of "here" is not the app's.
+          meta.resolvedFrom = this.ctx.getSaveBaseDir();
+        }
+        await assertSafePngTarget(absPath);
+        // Async FS so a slow disk doesn't block the Electron main thread.
+        await fs.promises.mkdir(path.dirname(absPath), { recursive: true });
+        await fs.promises.writeFile(absPath, Buffer.from(base64, "base64"));
+        meta.savedTo = absPath;
+        this.ctx.log.info(`get_screenshot saved ${absPath}`);
+      } catch (e: any) {
+        meta.saveError = `${absPath}: ${e.message}`;
+        this.ctx.log.error(`get_screenshot could not write ${absPath}: ${e.message}`);
+      }
+    }
+
+    content.push({ type: "text", text: JSON.stringify(meta, null, 2) });
+    return { content };
+  }
+
+  /**
+   * Absolute path for a requested `savePath`. A relative one resolves against
+   * the app's export directory — see ToolContext.getSaveBaseDir for why not
+   * `process.cwd()`.
+   */
+  private resolveSavePath(savePath: string): string {
+    if (path.isAbsolute(savePath)) return savePath;
+    return path.resolve(this.ctx.getSaveBaseDir(), savePath);
+  }
+
+  /**
+   * Fallback: Electron's capturePage on the webContents — the whole visible
+   * window, not a node. Only reached when no nodeId was asked for; the result
+   * is marked so a caller can tell it apart from a real node export.
+   */
+  private async capturePageFallback(savePath: string | null, degraded: string) {
+    const view = this.ctx.viewProvider.getActiveTabView();
+    if (!view) return toolError("No active Figma view");
+
+    const image = await view.webContents.capturePage();
+    const buffer = image.toPNG();
+    return this.buildScreenshotResponse(
+      buffer.toString("base64"),
+      "",
+      "canvas (capturePage fallback)",
+      savePath,
+      { degraded },
+    );
+  }
+
+  // ── Tool: get_variable_defs ──────────────────────────────────────────────
+
+  public async toolGetVariableDefs(args: Record<string, unknown>) {
+    const nodeId = normalizeNodeId(args.nodeId);
+    const script = VARIABLE_DEFS_SCRIPT(nodeId);
+    const result = await this.exec(script);
+
+    if (result?.error) {
+      return toolError(result.error);
+    }
+
+    return toolResult(safeStringify(result));
+  }
+
+  // ── Tool: get_code_connect_map ───────────────────────────────────────────
+
+  public toolGetCodeConnectMap() {
+    const map: Record<string, { codeConnectSrc: string; codeConnectName: string }> = {};
+    for (const [nodeId, entry] of this.ctx.codeConnectMap) {
+      map[nodeId] = {
+        codeConnectSrc: entry.codeConnectSrc,
+        codeConnectName: entry.codeConnectName,
+      };
+    }
+
+    return toolResult(
+      JSON.stringify(
+        {
+          mappings: map,
+          count: this.ctx.codeConnectMap.size,
+        },
+        null,
+        2,
+      ),
+    );
+  }
+
+  // ── Tool: get_figjam ─────────────────────────────────────────────────────
+
+  public async toolGetFigjam(args: Record<string, unknown>) {
+    const nodeId = normalizeNodeId(args.nodeId);
+    const script = FIGJAM_SCRIPT(nodeId);
+    const result = await this.exec(script);
+
+    if (result?.error) {
+      return toolError(result.error);
+    }
+
+    // Try to capture screenshots of top nodes
+    const screenshots: Record<string, string> = {};
+    if (result.nodeIds?.length > 0) {
+      for (const nid of result.nodeIds.slice(0, 5)) {
+        try {
+          const ssScript = SCREENSHOT_SCRIPT(nid, 1);
+          const ssResult = await this.exec(ssScript);
+          if (ssResult?.base64) {
+            const buffer = Buffer.from(ssResult.base64, "base64");
+            const assetId = `${crypto.randomUUID()}.png`;
+            this.ctx.assetStore.set(assetId, { data: buffer, contentType: "image/png" });
+            setTimeout(() => this.ctx.assetStore.delete(assetId), 10 * 60 * 1000);
+            screenshots[nid] = `http://${MCP_HOST}:${this.ctx.getPort()}/assets/${assetId}`;
+          }
+        } catch {
+          /* skip */
+        }
+      }
+    }
+
+    let xml = result.xml ?? "";
+    if (Object.keys(screenshots).length > 0) {
+      xml += "\n<!-- Node Screenshots -->\n";
+      for (const [nid, url] of Object.entries(screenshots)) {
+        xml += `<!-- node="${nid}" screenshot="${url}" -->\n`;
+      }
+    }
+
+    return toolResult(xml);
+  }
+
+  // ── Tool: generate_diagram ───────────────────────────────────────────────
+
+  public async toolGenerateDiagram(args: Record<string, unknown>) {
+    const mermaid = args.mermaid as string;
+    if (!mermaid) {
+      return toolError("Missing required field: mermaid (Mermaid diagram syntax)");
+    }
+
+    const { nodes, edges } = parseMermaid(mermaid);
+    if (nodes.length === 0) {
+      return toolError("Could not parse any nodes from the Mermaid syntax.");
+    }
+
+    const nodesWithEdges = nodes.map((n) => ({
+      ...n,
+      _edges: edges.filter((e) => e.from === n.id),
+    }));
+    const nodesJson = JSON.stringify(nodesWithEdges);
+    const script = GENERATE_DIAGRAM_SCRIPT(nodesJson);
+    const result = await this.exec(script);
+
+    if (result?.error) {
+      return toolError(result.error);
+    }
+
+    return toolResult(
+      JSON.stringify(
+        {
+          success: true,
+          nodesCreated: result.nodesCreated,
+          connectorsCreated: result.connectorsCreated,
+          message: `Created ${result.nodesCreated} nodes and ${result.connectorsCreated} connectors in FigJam.`,
+        },
+        null,
+        2,
+      ),
+    );
+  }
+
+  // ── Tool: add_code_connect_map ───────────────────────────────────────────
+
+  public toolAddCodeConnectMap(args: Record<string, unknown>) {
+    const nodeId = normalizeNodeId(args.nodeId);
+    const codeConnectSrc = args.codeConnectSrc as string;
+    const codeConnectName = args.codeConnectName as string;
+
+    if (!nodeId || !codeConnectSrc || !codeConnectName) {
+      return toolError("Missing required fields: nodeId, codeConnectSrc, codeConnectName");
+    }
+
+    this.ctx.codeConnectMap.set(nodeId, { nodeId, codeConnectSrc, codeConnectName });
+    this.ctx.log.info(
+      "Code Connect mapping added:",
+      nodeId,
+      "→",
+      codeConnectName,
+      `(${codeConnectSrc})`,
+    );
+
+    return toolResult(
+      JSON.stringify(
+        {
+          success: true,
+          nodeId,
+          codeConnectSrc,
+          codeConnectName,
+          totalMappings: this.ctx.codeConnectMap.size,
+        },
+        null,
+        2,
+      ),
+    );
+  }
+
+  // ── Tool: create_design_system_rules ─────────────────────────────────────
+
+  public async toolCreateDesignSystemRules(args: Record<string, unknown>) {
+    const techStack = (args.techStack as string) || "Not specified";
+    const componentLibraryPath = (args.componentLibraryPath as string) || "Not specified";
+
+    // Collect design system data from Figma
+    const result = await this.exec(DESIGN_SYSTEM_RULES_SCRIPT);
+
+    if (result?.error) {
+      return toolError(result.error);
+    }
+
+    // Format as a design system rules document
+    const lines: string[] = [
+      `# Design System Rules — ${result.fileName}`,
+      "",
+      `> Auto-generated from Figma file "${result.fileName}"`,
+      "",
+      "## Tech Stack",
+      `- Framework: ${techStack}`,
+      `- Component Library: ${componentLibraryPath}`,
+      "",
+    ];
+
+    // Variables/tokens
+    if (result.collections?.length > 0) {
+      lines.push("## Design Tokens (Variables)", "");
+      for (const coll of result.collections) {
+        lines.push(`### ${coll.name}`, `Modes: ${coll.modes.join(", ")}`, "");
+        lines.push("| Token | Type | Values |", "|-------|------|--------|");
+        for (const v of coll.variables.slice(0, 50)) {
+          const values = Object.entries(v.values || {})
+            .map(([mode, val]: [string, any]) => `${mode}: ${JSON.stringify(val)}`)
+            .join("; ");
+          lines.push(`| \`${v.name}\` | ${v.type} | ${values} |`);
+        }
+        lines.push("");
+      }
+    }
+
+    // Styles
+    if (result.styles?.length > 0) {
+      lines.push("## Styles", "");
+      lines.push("| Name | Type | Description |", "|------|------|-------------|");
+      for (const s of result.styles.slice(0, 50)) {
+        lines.push(`| \`${s.name}\` | ${s.type} | ${s.description ?? "—"} |`);
+      }
+      lines.push("");
+    }
+
+    // Components
+    if (result.components?.length > 0) {
+      lines.push("## Components", "");
+      for (const comp of result.components) {
+        lines.push(`- **${comp.name}** (${comp.type})`);
+        if (comp.properties && Object.keys(comp.properties).length > 0) {
+          for (const [propName, propDef] of Object.entries(comp.properties) as [string, any][]) {
+            lines.push(`  - \`${propName}\`: ${propDef?.type ?? "unknown"}`);
+          }
+        }
+      }
+      lines.push("");
+    }
+
+    // Code Connect mappings
+    if (this.ctx.codeConnectMap.size > 0) {
+      lines.push("## Code Connect Mappings", "");
+      lines.push("| Figma Node ID | Component | File |", "|---------------|-----------|------|");
+      for (const [_, entry] of this.ctx.codeConnectMap) {
+        lines.push(
+          `| ${entry.nodeId} | \`${entry.codeConnectName}\` | \`${entry.codeConnectSrc}\` |`,
+        );
+      }
+      lines.push("");
+    }
+
+    lines.push(
+      "## Usage Instructions",
+      "",
+      "Save this file to your project's `rules/` or `.cursor/rules/` directory.",
+      "Your AI coding assistant will use these rules to generate code that matches",
+      "your design system's tokens, styles, and component structure.",
+      "",
+    );
+
+    return toolResult(lines.join("\n"));
+  }
+
+  // ── Tool: search_design_system ──────────────────────────────────────────
+
+  public async toolSearchDesignSystem(args: Record<string, unknown>) {
+    const query = (args.query as string) || "";
+    if (!query) return toolError("query is required");
+
+    const result = await this.exec(SEARCH_DESIGN_SYSTEM_SCRIPT(query));
+    if (result?.error) return toolError(result.error);
+    return toolResult(safeStringify(result));
+  }
+
+  // ── Tool: use_figma (write) ─────────────────────────────────────────────
+
+  public async toolUseFigma(args: Record<string, unknown>) {
+    const action = args.action as string;
+    const params = args.params as Record<string, unknown>;
+    if (!action) return toolError("action is required");
+    if (!params) return toolError("params is required");
+
+    const paramsJson = JSON.stringify(params);
+    const result = await this.exec(USE_FIGMA_SCRIPT(action, paramsJson));
+    if (result?.error) return toolError(result.error);
+    return toolResult(safeStringify(result));
+  }
+
+  // ── Tool: create_new_file (create page, write) ──────────────────────────
+
+  public async toolCreateNewFile(args: Record<string, unknown>) {
+    const name = (args.name as string) || "Untitled Page";
+    const result = await this.exec(CREATE_PAGE_SCRIPT(name));
+    if (result?.error) return toolError(result.error);
+    return toolResult(safeStringify(result));
+  }
+
+  // ── Tool: figma_find (read) ──────────────────────────────────────────────
+
+  public async toolFigmaFind(args: Record<string, unknown>) {
+    const nodeId = normalizeNodeId(args.nodeId);
+    const opts = {
+      query: typeof args.query === "string" ? args.query : null,
+      type: typeof args.type === "string" ? args.type : null,
+      text: typeof args.text === "string" ? args.text : null,
+      limit: typeof args.limit === "number" ? args.limit : 100,
+    };
+
+    const result = await this.exec(FIND_NODES_SCRIPT(nodeId, JSON.stringify(opts)));
+    if (result?.error) return toolError(result.error);
+    return toolResult(safeStringify(result));
+  }
+
+  // ── Tool: figma_tree (read) ──────────────────────────────────────────────
+
+  public async toolFigmaTree(args: Record<string, unknown>) {
+    const nodeId = normalizeNodeId(args.nodeId);
+    const maxDepth = typeof args.maxDepth === "number" ? args.maxDepth : 5;
+
+    const { result, logs } = await this.execWithLogs(TREE_SCRIPT(nodeId, maxDepth));
+    if (result?.error) return toolError(result.error);
+    return toolResult(appendLogs(result?.tree ?? "", logs));
+  }
+
+  // ── Tool: figma_text (write) ─────────────────────────────────────────────
+
+  public async toolFigmaText(args: Record<string, unknown>) {
+    const nodeId = normalizeNodeId(args.nodeId);
+    if (!nodeId) return toolError("nodeId is required");
+    if (typeof args.characters !== "string") return toolError("characters is required");
+
+    const result = await this.exec(SET_TEXT_SCRIPT(nodeId, JSON.stringify(args.characters)));
+    if (result?.error) return toolError(result.error);
+    return toolResult(safeStringify(result));
+  }
+}

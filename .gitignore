@@ -1,0 +1,57 @@
+node_modules
+.cache
+.env
+*.log
+dist
+gpg
+gui
+build
+*.deb
+*.bak
+Figma-app*
+snap/parts
+snap/prime
+snap/snap
+snap/stage
+bun.lockb
+docs
+
+# Flatpak local build output (flatpak-builder --user --install build-dir flatpak/...)
+build-dir
+.flatpak-builder
+
+# OS
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# IDE
+.vscode
+vscode
+.idea
+*.swp
+*.swo
+.zed
+
+# Electron
+*.asar
+
+# Coverage & testing
+coverage
+test-results
+playwright-report
+
+# Generated release notes (CI artifact)
+release_notes
+
+# Auto-generated changelog data baked at build time
+src/renderer/Changelog/_data.ts
+
+# Agents
+.agent
+.gemini
+.jules/
+tsconfig.tsbuildinfo
+
+# Local Settings UI/UX exploration
+settings-prototype/

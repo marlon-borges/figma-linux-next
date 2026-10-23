@@ -1,0 +1,218 @@
+# <img src="resources/icons/128x128.png" width="32"> Figma Linux Next
+
+Native app based on [Electron](http://electron.atom.io)-based browser wrapper for the [Figma](https://figma.com) web app on Linux.
+Loads figma.com directly — no private APIs, no data scraping, no account sharing.
+Not affiliated with or endorsed by Figma, Inc.
+
+> **About this fork.** This repository is based on
+> [arximus88/figma-linux-next](https://github.com/arximus88/figma-linux-next) (itself descended
+> from [Figma-Linux/figma-linux](https://github.com/Figma-Linux/figma-linux)) and keeps its
+> GPL-2.0 license. Credit for the app goes to its original authors and contributors; their
+> commit history lives in the original repository. This fork starts at v0.22.2 with security
+> hardening (see the [CHANGELOG](CHANGELOG.md)). Issue, PR and discussion numbers in the
+> CHANGELOG refer to the original repository.
+
+<p>
+  <a href="https://github.com/marlon-borges/figma-linux-next/releases"><img alt="Release" src="https://img.shields.io/github/v/release/marlon-borges/figma-linux-next?style=flat-square&logo=github"></a>
+  <a href="https://github.com/marlon-borges/figma-linux-next/releases"><img alt="Downloads" src="https://img.shields.io/github/downloads/marlon-borges/figma-linux-next/total?style=flat-square&color=success"></a>
+  <a href="https://github.com/marlon-borges/figma-linux-next/actions/workflows/ci.yml"><img alt="CI" src="https://img.shields.io/github/actions/workflow/status/marlon-borges/figma-linux-next/ci.yml?branch=staging&style=flat-square&label=CI&logo=githubactions&logoColor=white"></a>
+  <a href="LICENSE"><img alt="License" src="https://img.shields.io/github/license/marlon-borges/figma-linux-next?style=flat-square"></a>
+</p>
+<p>
+  <a href="https://github.com/marlon-borges/figma-linux-next/stargazers"><img alt="Stars" src="https://img.shields.io/github/stars/marlon-borges/figma-linux-next?style=flat-square&logo=github"></a>
+  <a href="https://github.com/marlon-borges/figma-linux-next/issues"><img alt="Issues" src="https://img.shields.io/github/issues/marlon-borges/figma-linux-next?style=flat-square"></a>
+  <a href="https://github.com/marlon-borges/figma-linux-next/commits"><img alt="Last commit" src="https://img.shields.io/github/last-commit/marlon-borges/figma-linux-next?style=flat-square"></a>
+</p>
+<p>
+  <img alt="Electron" src="https://img.shields.io/badge/Electron-44-47848F?style=flat-square&logo=electron&logoColor=white">
+  <img alt="Svelte" src="https://img.shields.io/badge/Svelte-5-FF3E00?style=flat-square&logo=svelte&logoColor=white">
+  <img alt="Vite" src="https://img.shields.io/badge/Vite-8-646CFF?style=flat-square&logo=vite&logoColor=white">
+  <img alt="Bun" src="https://img.shields.io/badge/Bun-000000?style=flat-square&logo=bun&logoColor=white">
+  <img alt="Biome" src="https://img.shields.io/badge/Biome-60A5FA?style=flat-square&logo=biome&logoColor=white">
+</p>
+
+> **🧪 Status: Active Testing**
+> Pre-built binaries (`.pacman`, `.deb`, `.rpm`, `.AppImage`) for x64 and arm64:
+> **https://github.com/marlon-borges/figma-linux-next/releases**
+
+## Features
+
+- **Local system fonts** — full fontconfig (`fc-list`) enumeration plus fontkit for variable-font axes; variable fonts and all named instances work, just like the official desktop app (the web app can't reach them).
+- **Shader, Halftone & Noise effects** — Figma's new WebGPU canvas effects render, matching the official app (opt-in, Experimental). They require X11/XWayland: on a Wayland session, enabling them relaunches the app under XWayland, so you trade native Wayland features (fractional scaling, per-monitor DPI) for shaders while they're on.
+- **Local plugin development** — import a plugin from its `manifest.json` and iterate locally with hot-reload.
+- **Figma links open in the app** — the app answers the local-helper check figma.com makes from a browser, so **Open in desktop app** and the **Open links in desktop app** preference work on Linux like they do on Mac and Windows. See [Opening links from your browser](#opening-links-from-your-browser).
+- **Built-in MCP server for AI assistants** — a [Model Context Protocol](https://modelcontextprotocol.io) server (default port 3845) lets AI tools like Claude Code read **and** write your open design: scene-graph metadata, design context, variables/styles, screenshots, plus create/edit nodes and Mermaid→FigJam diagrams. Read-only by default; write tools, the port, and an optional Chrome DevTools control plane are toggled in Settings. See [AI integration (MCP)](#ai-integration-mcp).
+- **Latest Chromium engine** — Electron 44 / Chromium 152, so the canvas, WebGL and color handling track the current web app.
+- **Up-to-date Google Fonts** — Google Sans, Google Sans Flex, Google Sans Code and other recent additions are available.
+- **Runs on both Wayland and X11** — native Wayland on GNOME, KDE Plasma, Sway, Hyprland, with a clean X11 fallback. Tested on Asahi Linux (Apple Silicon), Niri, and openSUSE.
+- **Native window frame styles** — GNOME (Adwaita), KDE Plasma (Breeze) and Legacy Windows (Figma's own Windows chrome) frames, picked automatically from your desktop environment (Plasma → Breeze, GNOME → Adwaita, anything else → Legacy) with a manual override in Settings (macOS TBD). The frame follows Figma's Light/Dark/System theme, the minimize/maximize buttons can be hidden for a stock-GNOME look, and the new-tab `+` can sit after the last tab (as in Figma's own desktop app) instead of the left corner. Resting the pointer on a tab shows a card with its title, Figma's thumbnail of the file and when it was last edited (off switch in Settings).
+- **Instant new-file tab** — pre-loaded in the background after login, opens with no delay.
+- **System tray** — opt-in in Settings: Figma stays in the tray when the last window closes; "Show Figma" brings it back (restoring a minimised window), with New Window, Settings and Quit alongside. Native on KDE Plasma, needs the AppIndicator extension on GNOME.
+- **Config isolation** — uses `~/.config/figma-linux-next`, no conflicts with legacy installations.
+
+## Opening links from your browser
+
+On Mac and Windows, Figma in a browser offers **Open in desktop app** and an **Open links in desktop
+app** preference. It does not use `figma://` for that: the page probes a small local helper the
+official app installs at `127.0.0.1:44950` and, when it answers, hands the file link over. The page's
+own platform check already includes Linux, so figma-linux-next answers that probe (on by default,
+**Settings → Integrations → Open links from your browser**).
+
+To use it, open any file on figma.com in Chrome or Firefox and pick **Main menu → Preferences →
+Open links in desktop app**; **Open in desktop app** in the same menu does it once. Chrome 142 and
+newer first ask to allow *local network access* for figma.com — the link that triggers that prompt
+stays in the browser, the next one opens here. The same account must be signed in here. Only requests from figma.com are answered and only figma.com links are opened; the port is the
+one Figma's page looks for and cannot change. A `figma://` link still opens the app directly.
+
+## AI integration (MCP)
+
+figma-linux-next ships a built-in [Model Context Protocol](https://modelcontextprotocol.io) server so
+assistants like Claude Code can work with your **live** design — no plugin to install, no cloud
+round-trip. Everything binds to `127.0.0.1` and is configured in **Settings → General → MCP integrations**.
+
+- **Data plane — Figma MCP** (HTTP, default `127.0.0.1:3845`, on by default). Reads file info,
+  scene-graph metadata, design context, variables & styles, Code Connect maps, and node screenshots;
+  helper tools `figma_find` / `figma_tree` locate and outline nodes cheaply, and it can emit
+  design-system rules for your codebase. With **write tools** enabled (opt-in) it also creates and edits
+  frames, text, rectangles and variables, and turns Mermaid into FigJam diagrams. The port and the
+  write-tools gate are both configurable.
+- **Control plane — Chrome DevTools (CDP)** (opt-in, needs a restart). Exposes the app window over
+  `--remote-debugging-port` so a CDP client (e.g. [chrome-devtools-mcp](https://github.com/ChromeDevTools/chrome-devtools-mcp))
+  can drive the UI — switch tabs, click, type, screenshot the real window. Paired with the data plane,
+  an assistant can navigate to a file and then read or edit it.
+
+Read access is on out of the box; anything that mutates your files or exposes window control is
+off-by-default and opt-in.
+
+The data plane reads files through Figma's own Plugin API (`window.figma`), which Figma exposes only
+when you can **edit** the file: not with a Dev or View seat, not in files shared with you as
+"can view" (Dev Mode included), not in Sites files, and not where your organization has turned
+plugins off. When a tool can't read a file it says which of these applies. For files you can only
+view, use [Figma's remote MCP server](https://help.figma.com/hc/en-us/articles/32132100833559),
+which works with view access.
+
+## Tech Stack
+
+- **Electron 44** (Chromium 152)
+- **Svelte 5** with runes
+- **Vite 8**
+- **Bun**
+- **Biome** (lint + format)
+
+## Installation
+
+Download from **https://github.com/marlon-borges/figma-linux-next/releases**:
+
+```bash
+# Arch / CachyOS (x64)
+sudo pacman -U figma-linux-next_*_linux_x64.pacman
+
+# Debian / Ubuntu (x64 or arm64)
+sudo dpkg -i figma-linux-next_*_amd64.deb
+# or
+sudo dpkg -i figma-linux-next_*_arm64.deb
+
+# Fedora / openSUSE
+sudo rpm -i figma-linux-next_*_x86_64.rpm
+
+# AppImage
+chmod +x figma-linux-next_*.AppImage && ./figma-linux-next_*.AppImage
+```
+
+> **AppImage note:** On first launch the app automatically registers the `figma://` URL handler required for login. If login still fails after first launch, register it manually:
+>
+> ```bash
+> # Run once to register the handler
+> ~/.local/share/applications/figma-linux-next-appimage.desktop  # created on first launch
+> xdg-mime default figma-linux-next-appimage.desktop x-scheme-handler/figma
+> update-desktop-database ~/.local/share/applications/
+> ```
+
+### Flatpak
+
+> **Not published by this fork yet.** Until its own signed repository is set up, use the
+> `.flatpak` bundle from the Releases page (it does not update itself).
+
+One click: open **https://marlon-borges.github.io/figma-linux-next/** and use the install button
+(GNOME Software and KDE Discover handle `.flatpakref` files directly). Or from the terminal:
+
+```bash
+flatpak install --user https://marlon-borges.github.io/figma-linux-next/figma-linux-next.flatpakref
+```
+
+This adds the project's own signed Flatpak repository, so later releases arrive through
+`flatpak update` and the software centre like any other Flatpak. The standalone `.flatpak`
+bundle on the Releases page still works but does not update itself.
+
+### AUR (Arch / CachyOS)
+
+> The AUR packages are maintained by the original project and build *its* releases, not this
+> fork's. For this fork use the `.pacman` file from the Releases page.
+
+```bash
+yay -S figma-linux-next
+```
+
+Or with any other AUR helper. Package: [figma-linux-next](https://aur.archlinux.org/packages/figma-linux-next)
+
+### NixOS
+
+> **Not published by this fork yet.** The flake resolves release binaries from this repository,
+> which become available once the Nix release job is enabled here.
+
+The `--extra-experimental-features` part is only needed until flakes are enabled in your
+config (`nix.settings.experimental-features = [ "nix-command" "flakes" ];`).
+
+**Install for your user**, no system config, no rebuild:
+```bash
+nix profile add --extra-experimental-features "nix-command flakes" github:marlon-borges/figma-linux-next
+xdg-mime default figma-linux-next.desktop x-scheme-handler/figma
+```
+The second line is what makes "Log in with browser" come back to the app. Log in from Firefox
+or a Chromium-based browser: GNOME Web (Epiphany) does not hand `figma://` links over to the
+app. Update later with
+`nix profile upgrade figma-linux-next` (older Nix: `install` instead of `add`).
+
+**Declarative (NixOS module):** add the flake input and enable the program:
+```nix
+inputs.figma-linux-next.url = "github:marlon-borges/figma-linux-next";
+
+# in your nixosConfiguration
+imports = [ figma-linux-next.nixosModules.default ];
+programs.figma-linux-next.enable = true;
+```
+The module installs the package and registers the `figma://` handler for you. Without the
+`imports` line `programs.figma-linux-next` is not a known option and evaluation fails.
+
+The flake ships the prebuilt release binaries (x86_64 and aarch64) and is pinned to a specific
+version, which CI updates after each release. Pin it yourself by pointing at a tag:
+`github:marlon-borges/figma-linux-next/v0.20.1`.
+
+## Migration from legacy figma-linux
+
+Settings are stored in `~/.config/figma-linux-next`. To carry over settings from the old installation:
+
+```bash
+cp ~/.config/figma-linux/settings.json ~/.config/figma-linux-next/
+```
+
+## Building from source
+
+```bash
+git clone https://github.com/marlon-borges/figma-linux-next.git
+cd figma-linux-next
+bun install
+bun run dev      # dev mode with HMR
+bun run build    # production build
+bun run start    # run production build
+bun run pack     # build all packages
+```
+
+## Issues & Discussions
+
+- https://github.com/marlon-borges/figma-linux-next/issues
+- https://github.com/marlon-borges/figma-linux-next/discussions
+
+## License
+
+GPL-2.0-only — see [LICENSE](LICENSE).
