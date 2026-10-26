@@ -22,7 +22,14 @@ export class Process {
   };
 
   public execSync = (file: string, args: string[]): string => {
-    return execFileSync(file, args, { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+    // `env` is the default, but Bun (1.3.14) resolves the program against the PATH the
+    // process started with unless it is passed — the unit tests' fake zenity was skipped.
+    return execFileSync(file, args, {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"],
+      // globalThis: `process` below is this module's export.
+      env: globalThis.process.env,
+    });
   };
 }
 
