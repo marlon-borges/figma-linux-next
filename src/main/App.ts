@@ -5,6 +5,7 @@ import { isAppAuthLink, isValidProjectLink } from "Utils/Common";
 import { readAppVersion } from "Utils/Main";
 import Args from "./Args";
 import { registerUrlHandler } from "./UrlHandlerIntegration";
+import { restoreOriginalSessionEnv } from "./applyChromiumSwitches";
 import { logger } from "./Logger";
 import { storage } from "./Storage";
 
@@ -238,6 +239,7 @@ export default class App {
       return;
     }
 
+    restoreOriginalSessionEnv();
     app.relaunch();
     app.quit();
   }

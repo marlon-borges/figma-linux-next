@@ -19,6 +19,7 @@ export const BASE_DEFAULT_SETTINGS: Types.SettingsInterface = {
     lastTimeClearLogFile: 0,
     enableColorSpaceSrgb: false,
     enableWebGPU: false,
+    enableVulkanRenderer: true,
     useZenity: false,
     panelHeight: 40,
     saveLastOpenedTabs: true,

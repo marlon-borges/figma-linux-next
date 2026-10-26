@@ -34,8 +34,7 @@ try {
   // settings.json missing or unreadable (e.g. first run) — fall back to defaults.
 }
 
-// Figma's Skia Graphite renderer (needed for Shader/Halftone effects) only initializes
-// under X11 ozone, and bringing up an XWayland window requires a CLEAN X11 environment from
+// WebGPU shaders and the NVIDIA Vulkan renderer only work under X11 ozone, and bringing up an XWayland window requires a CLEAN X11 environment from
 // the very start of the process. Electron reads WAYLAND_DISPLAY during early native init —
 // before this script runs — so stripping it from process.env here is too late: the GPU
 // process is already forked with the Wayland env and the window fails ("XGetWindowAttributes
@@ -50,6 +49,9 @@ if (shouldRelaunchUnderX11(savedSettings.app ?? {})) {
     ...process.env,
     XDG_SESSION_TYPE: "x11",
     FIGMA_FORCE_X11: "1",
+    // Kept so a restart from inside the app can return to Wayland (restoreOriginalSessionEnv).
+    FIGMA_ORIG_WAYLAND_DISPLAY: process.env.WAYLAND_DISPLAY,
+    FIGMA_ORIG_XDG_SESSION_TYPE: process.env.XDG_SESSION_TYPE,
   };
   delete childEnv.WAYLAND_DISPLAY;
   spawn(process.execPath, process.argv.slice(1), {

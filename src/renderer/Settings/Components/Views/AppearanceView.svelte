@@ -71,5 +71,8 @@
     >
       <Toggle bind:checked={$settings.app.enableWebGPU} />
     </SettingRow>
+    <SettingRow setting={SETTINGS.vulkanRenderer} badge="Restart" badgeKind="warning">
+      <Toggle bind:checked={$settings.app.enableVulkanRenderer} />
+    </SettingRow>
   </div>
 </section>

@@ -114,6 +114,14 @@ export const SETTINGS = {
     subtitle: "Shader, Halftone and Noise effects. Runs the app under XWayland.",
     keywords: "gpu shader effects halftone noise xwayland vulkan",
   }),
+  vulkanRenderer: setting({
+    id: "vulkan-renderer",
+    section: "appearance",
+    title: "Vulkan renderer (NVIDIA)",
+    subtitle:
+      "Smoother canvas with NVIDIA's driver, especially while a video plays. Runs the app under XWayland. No effect on other GPUs.",
+    keywords: "gpu nvidia vulkan angle opengl video lag slow performance xwayland",
+  }),
   frameAuto: setting({
     id: "frame-auto",
     section: "tabs",

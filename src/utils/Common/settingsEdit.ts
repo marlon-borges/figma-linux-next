@@ -12,6 +12,7 @@
 export const EDITABLE_APP_KEYS = [
   "enableColorSpaceSrgb",
   "enableWebGPU",
+  "enableVulkanRenderer",
   "useZenity",
   "saveLastOpenedTabs",
   "exportDir",
@@ -93,6 +94,10 @@ const RESTART_CHECKS: {
     differs: (a, b) => a.app.enableColorSpaceSrgb !== b.app.enableColorSpaceSrgb,
   },
   { label: "WebGPU shaders", differs: (a, b) => a.app.enableWebGPU !== b.app.enableWebGPU },
+  {
+    label: "Vulkan renderer",
+    differs: (a, b) => a.app.enableVulkanRenderer !== b.app.enableVulkanRenderer,
+  },
   {
     label: "Chromium switches",
     differs: (a, b) =>

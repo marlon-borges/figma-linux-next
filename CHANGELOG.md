@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Playing a video on the canvas froze Figma on NVIDIA.** While a video plays Figma re-renders
+  the whole scene every frame, and NVIDIA's OpenGL driver spent so much CPU per command that the
+  GPU process sat at 100% and the canvas — pan and zoom included — dropped to 2–8 fps (Chrome on
+  the same machine does the same). With NVIDIA's proprietary driver the app now renders through
+  ANGLE on Vulkan, which brought a heavy file from ~5 to ~23 fps. Wayland's Chromium backend
+  rejects Vulkan, so this mode runs under XWayland, like WebGPU shaders. Turn it off in
+  Settings → Appearance → **Vulkan renderer (NVIDIA)**; other GPUs are unaffected.
+- **WebGPU shaders on NVIDIA ran on the CPU.** Dawn fell back to SwiftShader; the Vulkan
+  renderer gives it the real GPU, with the GPU sandbox still on.
+- **Restarting from the app stayed on XWayland** after turning WebGPU shaders off: the relaunched
+  process inherited the stripped environment. It now picks its session afresh.
+
 ## [0.22.2] - 2026-10-23
 
 A security release that also brings Figma links from your browser into the app. Websites open in
