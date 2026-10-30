@@ -9,6 +9,8 @@
  * listed here; everything else stays main's.
  */
 
+import { isValidTrackpadSpeed } from "./trackpad";
+
 export const EDITABLE_APP_KEYS = [
   "enableColorSpaceSrgb",
   "enableWebGPU",
@@ -29,6 +31,8 @@ export const EDITABLE_APP_KEYS = [
   "trayEnabled",
   "panelHeight",
   "figmaAgentEnabled",
+  "trackpadPanSpeed",
+  "trackpadZoomSpeed",
 ] as const;
 
 export const EDITABLE_UI_KEYS = ["scalePanel", "scaleFigmaUI"] as const;
@@ -125,6 +129,7 @@ export type SettingsEffect =
   | { type: "mcpWriteTools"; enabled: boolean }
   | { type: "mcpServer"; enabled: boolean; port: number }
   | { type: "figmaAgent"; enabled: boolean }
+  | { type: "trackpad"; pan: number; zoom: number }
   | { type: "frameStyle" }
   | { type: "panelLayout" };
 
@@ -158,6 +163,13 @@ export function planSettingsUpdate(
     next.app.lazyRestoreEagerCount = current.app.lazyRestoreEagerCount;
   }
 
+  if (!isValidTrackpadSpeed(next.app.trackpadPanSpeed)) {
+    next.app.trackpadPanSpeed = current.app.trackpadPanSpeed;
+  }
+  if (!isValidTrackpadSpeed(next.app.trackpadZoomSpeed)) {
+    next.app.trackpadZoomSpeed = current.app.trackpadZoomSpeed;
+  }
+
   const effects: SettingsEffect[] = [];
   const a = current;
   const b = next;
@@ -180,6 +192,12 @@ export function planSettingsUpdate(
   }
   if (a.app.figmaAgentEnabled !== b.app.figmaAgentEnabled) {
     effects.push({ type: "figmaAgent", enabled: !!b.app.figmaAgentEnabled });
+  }
+  if (
+    a.app.trackpadPanSpeed !== b.app.trackpadPanSpeed ||
+    a.app.trackpadZoomSpeed !== b.app.trackpadZoomSpeed
+  ) {
+    effects.push({ type: "trackpad", pan: b.app.trackpadPanSpeed, zoom: b.app.trackpadZoomSpeed });
   }
   if (a.app.frameStyleAuto !== b.app.frameStyleAuto || a.app.frameStyle !== b.app.frameStyle) {
     effects.push({ type: "frameStyle" });
