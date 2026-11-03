@@ -278,6 +278,7 @@ export class McpServer {
         Connection: "keep-alive",
         ...cors(),
       });
+      res.flushHeaders();
       session.sseResponse = res;
       req.on("close", () => {
         session.sseResponse = null;
