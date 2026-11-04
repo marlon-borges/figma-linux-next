@@ -208,14 +208,18 @@ export class McpServer {
       return;
     }
 
-    // Origin validation: refuse requests made by web pages (see isAllowedOrigin).
-    // Checked before the OPTIONS branch so a foreign preflight fails too.
+    // Origin validation: the MCP spec requires it, and without it any web page
+    // could call these tools through the user's browser.
     const origin = req.headers.origin;
     if (!isAllowedOrigin(origin)) {
-      this.log.error("Access denied — origin not allowed:", origin);
+      this.log.error("Access denied — Origin not allowed:", origin);
       res.writeHead(403);
-      res.end("Access denied — origin not allowed");
+      res.end("Access denied — Origin not allowed");
       return;
+    }
+    if (origin) {
+      res.setHeader("Access-Control-Allow-Origin", origin);
+      res.setHeader("Vary", "Origin");
     }
 
     // Standard security headers
