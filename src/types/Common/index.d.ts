@@ -95,6 +95,8 @@ declare namespace Types {
     title?: string;
     url?: string;
     groupId?: string;
+    /** The account the tab ran as. Absent in state saved before tabs kept their own. */
+    userId?: string;
   }
 
   interface ShortcutsMap {

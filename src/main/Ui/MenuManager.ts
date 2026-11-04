@@ -42,7 +42,14 @@ export default class MenuManager {
           type: "normal",
           label: data.title,
           click: (_, window) => {
-            app.emit("restoreClosedTab", window?.id, data.title, data.url, data.groupId);
+            app.emit(
+              "restoreClosedTab",
+              window?.id,
+              data.title,
+              data.url,
+              data.groupId,
+              data.userId,
+            );
           },
         })),
       });

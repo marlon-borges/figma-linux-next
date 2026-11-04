@@ -23,11 +23,11 @@ export default class FileController {
     ipcRegistry.handle("createFile", this.createFile.bind(this), "FileController");
   }
 
-  private async createFile(_: IpcMainInvokeEvent, args: WebApi.CreateFile) {
+  private async createFile(event: IpcMainInvokeEvent, args: WebApi.CreateFile) {
     const window = this.windowManager.getLastFocusedWindow();
 
     if (window) {
-      return window.createFile(args);
+      return window.createFile(args, event.sender.id);
     }
   }
 

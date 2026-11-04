@@ -288,26 +288,6 @@ describe("Window Tab Routing", () => {
     });
   });
 
-  describe("Account switch: deferred tab refresh applied on focus", () => {
-    test("setTabFocus applies a deferred fuid update before showing the tab", () => {
-      const tabManager: any = (windowInstance as any).tabManager;
-      spyOn(tabManager, "getById").mockReturnValue({ id: 42, setBounds: mock() });
-      const applySpy = spyOn(tabManager, "applyPendingUserId");
-      spyOn(windowInstance, "calcBoundsForTabView").mockReturnValue({
-        x: 0,
-        y: 0,
-        width: 0,
-        height: 0,
-      });
-      spyOn(windowInstance, "hideTabPreview").mockReturnValue(undefined);
-      spyOn(windowInstance as any, "swapTo").mockReturnValue(undefined);
-
-      windowInstance.setTabFocus(42);
-
-      expect(applySpy).toHaveBeenCalledWith(42);
-    });
-  });
-
   describe("Bug 3: saveLastOpenedTabs persisted empty tabs after closeAll", () => {
     test("getState returns cached snapshot after cacheStateBeforeClose, even when live tabs map has been cleared", () => {
       const tabManager: any = (windowInstance as any).tabManager;
@@ -646,6 +626,7 @@ describe("Window Tab Routing", () => {
           "https://www.figma.com/design/abc/A",
           "File A",
           "g1",
+          undefined,
         );
 
         setTimeoutSpy.mockRestore();
@@ -960,45 +941,78 @@ describe("Warm tab lifecycle", () => {
     expect(scheduled.some((t) => t.delay === 2000)).toBe(true);
   });
 
-  test("switching user re-navigates open project tabs with the new fuid", () => {
-    w.setUserId("user-1"); // first boot — no previous id yet
+  describe("each project tab keeps its own account", () => {
+    const FILE = "https://www.figma.com/design/abc/A";
 
-    const tabManager: any = (w as any).tabManager;
-    const reapplySpy = spyOn(tabManager, "reapplyUserId");
+    test("switching the home account leaves open tabs alone", () => {
+      w.setUserId("user-1");
+      const tab = (w as any).tabManager.addTab(`${FILE}?fuid=user-1`, "A");
+      tab.userId = "user-1"; // loadUrl, which sets it, is stubbed in this suite
+      const reload = spyOn(tab.view.webContents, "reload");
+      loadUrlSpy.mockClear();
 
-    w.setUserId("user-2", 77);
+      w.setUserId("user-2");
 
-    expect(reapplySpy).toHaveBeenCalledWith("user-2", 77);
-  });
+      expect(loadUrlSpy).not.toHaveBeenCalled();
+      expect(reload).not.toHaveBeenCalled();
+      expect(tab.userId).toBe("user-1");
+    });
 
-  test("an empty user id never re-navigates project tabs", () => {
-    w.setUserId("user-1");
+    test("new tabs open as the home account", () => {
+      w.setUserId("user-2");
 
-    const tabManager: any = (w as any).tabManager;
-    const reapplySpy = spyOn(tabManager, "reapplyUserId");
+      w.addTab(FILE);
 
-    w.setUserId("");
+      expect(loadUrlSpy.mock.calls.at(-1)?.[0]).toBe(`${FILE}?fuid=user-2`);
+    });
 
-    expect(reapplySpy).not.toHaveBeenCalled();
-  });
+    test("a tab reopened with its own account keeps it, whatever the home account", () => {
+      w.setUserId("user-2");
 
-  test("first setUserId does not re-navigate project tabs", () => {
-    const tabManager: any = (w as any).tabManager;
-    const reapplySpy = spyOn(tabManager, "reapplyUserId");
+      w.addTab(FILE, "A", undefined, "user-1");
 
-    w.setUserId("user-1");
+      expect(loadUrlSpy.mock.calls.at(-1)?.[0]).toBe(`${FILE}?fuid=user-1`);
+    });
 
-    expect(reapplySpy).not.toHaveBeenCalled();
-  });
+    test("a link opened from a tab inherits that tab's account", () => {
+      w.setUserId("user-2");
+      (w as any).panelLoaded = true;
+      spyOn(w, "setTabFocus").mockReturnValue(undefined);
 
-  test("re-entrant setUserId with the same id does not re-navigate project tabs", () => {
-    w.setUserId("user-1");
+      w.openUrl(FILE, "user-1");
 
-    const tabManager: any = (w as any).tabManager;
-    const reapplySpy = spyOn(tabManager, "reapplyUserId");
+      expect(loadUrlSpy.mock.calls.at(-1)?.[0]).toBe(`${FILE}?fuid=user-1`);
+    });
 
-    w.setUserId("user-1");
+    test("getState saves each tab's account so a restart restores it", () => {
+      w.setUserId("user-2");
+      const tab = (w as any).tabManager.addTab(`${FILE}?fuid=user-1`, "A");
+      tab.userId = "user-1";
 
-    expect(reapplySpy).not.toHaveBeenCalled();
+      expect(w.getState().tabs.at(-1)?.userId).toBe("user-1");
+    });
+
+    test("a project tab's report updates the tab and is not the home account", () => {
+      w.setUserId("user-2");
+      const tab = (w as any).tabManager.addTab(`${FILE}?fuid=user-1`, "A");
+
+      expect(w.recordProjectTabUser(tab.id, "user-3")).toBe(true);
+
+      expect(tab.userId).toBe("user-3");
+      expect(w.userId).toBe("user-2");
+    });
+
+    test("the home tab's report is left for the caller", () => {
+      const mainTabId = (w as any).tabManager.mainTab.id;
+
+      expect(w.recordProjectTabUser(mainTabId, "user-3")).toBe(false);
+    });
+
+    test("the warm tab's report never reaches the home account", () => {
+      w.setUserId("user-1");
+      flushTimers();
+
+      expect(w.recordProjectTabUser(lastWarmTab.id, "user-1")).toBe(true);
+    });
   });
 });

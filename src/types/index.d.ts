@@ -29,7 +29,13 @@ declare namespace Electron {
     on(event: "openFileBrowser", listener: (sender: Electron.WebContents) => void): this;
     on(
       event: "restoreClosedTab",
-      listener: (windowId: number, title: string, uri: string, groupId?: string) => void,
+      listener: (
+        windowId: number,
+        title: string,
+        uri: string,
+        groupId?: string,
+        userId?: string,
+      ) => void,
     ): this;
     on(event: "handle-page-command", listener: (item: any, window: BrowserWindow) => void): this;
     on(event: "log", listener: (data: any) => void): this;
@@ -44,7 +50,7 @@ declare namespace Electron {
     on(event: "handlePluginManageAction", listener: () => void): this;
     on(event: "handleWidgetManageAction", listener: () => void): this;
     on(event: "handleUrl", listener: (url: string) => void): this;
-    on(event: "openUrlInNewTab", listener: (url: string) => void): this;
+    on(event: "openUrlInNewTab", listener: (url: string, userId?: string) => void): this;
     on(event: "openUrlFromCommunity", listener: (url: string) => void): this;
     on(event: "openSettingsView", listener: () => void): this;
 
@@ -97,6 +103,7 @@ declare namespace Electron {
       title: string,
       uri: string,
       groupId?: string,
+      userId?: string,
     ): boolean;
     emit(event: "handle-page-command", item: any, window: BrowserWindow): boolean;
     emit(event: "log", data: any): boolean;
@@ -112,7 +119,7 @@ declare namespace Electron {
     emit(event: "handlePluginManageAction"): boolean;
     emit(event: "handleWidgetManageAction"): boolean;
     emit(event: "handleUrl", url: string): boolean;
-    emit(event: "openUrlInNewTab", url: string): boolean;
+    emit(event: "openUrlInNewTab", url: string, userId?: string): boolean;
     emit(event: "openUrlFromCommunity", url: string): boolean;
     emit(event: "openSettingsView"): boolean;
     emit(event: "relaunchApp"): void;

@@ -69,6 +69,8 @@ export default class AuthController {
   }
 
   private setInitialOptions(event: IpcMainEvent, data: WebApi.SetInitOptions) {
+    if (this.reportedByProjectTab(event.sender.id, data.userId)) return;
+
     if (data.userId) {
       storage.settings.userId = data.userId;
     }
@@ -85,11 +87,21 @@ export default class AuthController {
     // tab with a blank `fuid`.
     if (!userId) return;
 
-    storage.settings.userId = userId;
+    if (this.reportedByProjectTab(event.sender.id, userId)) return;
 
-    // The sender is the tab the switch happened in — it already runs as the
-    // new account, so it is the one tab that must not be reloaded.
-    this.windowManager.setUserIdOnAllWindows(userId, event.sender.id);
+    storage.settings.userId = userId;
+    this.windowManager.setUserIdOnAllWindows(userId);
+  }
+
+  /**
+   * Every Figma page announces its account as it boots. Only the home screen's
+   * announcement is the "current account": a project tab running as another
+   * account, on load or reload, must not drag the home screen back to it.
+   */
+  private reportedByProjectTab(webContentsId: number, userId: string | undefined): boolean {
+    const window = this.windowManager.getWindowByWebContentsId(webContentsId);
+
+    return window?.recordProjectTabUser(webContentsId, userId) ?? false;
   }
 
   public async logout() {

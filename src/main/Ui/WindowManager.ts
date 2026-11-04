@@ -130,9 +130,9 @@ export default class WindowManager {
     return [...ids];
   }
 
-  public setUserIdOnAllWindows(userId: string, sourceWebContentsId?: number) {
+  public setUserIdOnAllWindows(userId: string) {
     for (const [_, window] of this.windows) {
-      window.setUserId(userId, sourceWebContentsId);
+      window.setUserId(userId);
     }
   }
 
@@ -381,15 +381,16 @@ export default class WindowManager {
         this.closedTabs.set(tabInfo.title, {
           title: tabInfo.title,
           url: tabInfo.url,
+          userId: tabInfo.userId,
         });
       }
     }
   }
 
-  private openUrlInNewTab(url: string) {
+  private openUrlInNewTab(url: string, userId?: string) {
     const window = this.windows.get(this.lastFocusedwindowId);
 
-    window.openUrl(url);
+    window.openUrl(url, userId);
   }
   private openUrlFromCommunity(url: string) {
     const window = this.windows.get(this.lastFocusedwindowId);
@@ -467,7 +468,7 @@ export default class WindowManager {
     this.closedTabs.delete(last);
     storage.settings.app.recentlyClosedTabs = this.closedTabsForMenu;
 
-    window.addTab(tabInfo.url, tabInfo.title, tabInfo.groupId);
+    window.addTab(tabInfo.url, tabInfo.title, tabInfo.groupId, tabInfo.userId);
   }
   private handleCloseTab(window: Window, tabId: number) {
     const tabInfo = window.getTabInfo(tabId);
@@ -478,6 +479,7 @@ export default class WindowManager {
         title: tabInfo.title,
         url: tabInfo.url,
         groupId: tabInfo.groupId,
+        userId: tabInfo.userId,
       });
     }
 
@@ -503,10 +505,16 @@ export default class WindowManager {
 
     window.setFocusToMainTab();
   }
-  private restoreClosedTab(windowId: number, title: string, uri: string, groupId?: string) {
+  private restoreClosedTab(
+    windowId: number,
+    title: string,
+    uri: string,
+    groupId?: string,
+    userId?: string,
+  ) {
     const window = this.windows.get(windowId || this.lastFocusedwindowId);
 
-    window.addTab(uri, title, groupId);
+    window.addTab(uri, title, groupId, userId);
   }
   private openDevTools(event: IpcMainEvent, mode: "right" | "bottom" | "undocked" | "detach") {
     if (event.sender) {

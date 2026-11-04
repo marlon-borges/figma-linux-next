@@ -33,65 +33,6 @@ export default class TabManager {
     this.mainTab.setUserId(id);
   }
 
-  /**
-   * Refresh every open project tab so they stop acting as the previous
-   * account. A plain reload isn't enough: normal file URLs carry no fuid
-   * param, so a bare `webContents.reload()` would re-request the same URL
-   * and risk resolving back to whichever identity Figma treats as default —
-   * the same reason mainTab/warmTab/addTab always set fuid explicitly
-   * instead of relying on it.
-   *
-   * Only the tab that's actually visible right now is reloaded immediately;
-   * every background tab is just marked pending so switching accounts
-   * doesn't reload N tabs (and boot N Figma canvases) at once. Deferred tabs
-   * catch up in applyPendingUserId, right before they become focused.
-   */
-  public reapplyUserId(userId: string, sourceWebContentsId?: number) {
-    this.tabs.forEach((tab) => {
-      if (!tab.view.webContents.isDestroyed() && tab.view.webContents.id === sourceWebContentsId) {
-        // The tab the switch came from already runs as `userId`; reloading it
-        // would boot its canvas a second time.
-        tab.pendingUserId = undefined;
-      } else if (tab.id === this.lastFocusedTab) {
-        this.refreshTabUserId(tab, userId);
-      } else {
-        tab.pendingUserId = userId;
-      }
-    });
-  }
-
-  /** Apply a deferred account switch (see reapplyUserId) right before a tab is focused. */
-  public applyPendingUserId(tabId: number) {
-    const tab = this.tabs.get(tabId);
-    if (!tab || tab.pendingUserId === undefined) return;
-
-    this.refreshTabUserId(tab, tab.pendingUserId);
-  }
-
-  private refreshTabUserId(tab: Tab, userId: string) {
-    tab.pendingUserId = undefined;
-    if (tab.view.webContents.isDestroyed()) return;
-
-    const parsedUrl = parseURL(tab.getUrl());
-    if (!parsedUrl) return;
-
-    parsedUrl.searchParams.set("fuid", userId);
-    tab.loadUrl(parsedUrl.toString());
-
-    // Same family of issue as the "reattached view stays blank" gotcha
-    // (Window.swapTo): a loadURL() on an already-visible WebContentsView can
-    // land its first frame without the compositor actually presenting it on
-    // Wayland/Electron 44 — the page is genuinely showing the new account,
-    // it just doesn't paint until another visibility toggle, which is what a
-    // manual second click/focus accidentally provides. Force that toggle
-    // ourselves once the new page has actually loaded, but only if this tab
-    // is still the one on screen (the user may have switched away by then).
-    tab.view.webContents.once("did-finish-load", () => {
-      if (tab.view.webContents.isDestroyed() || this.lastFocusedTab !== tab.id) return;
-      tab.view.setVisible(false);
-      tab.view.setVisible(true);
-    });
-  }
   public addTab(url = RECENT_FILES, title?: string): Tab {
     const tab = new Tab(this.windowId);
 
@@ -190,9 +131,7 @@ export default class TabManager {
 
   public reloadAll() {
     this.tabs.forEach((t) => {
-      if (!t.view.webContents.isDestroyed()) {
-        t.view.webContents.reload();
-      }
+      t.reload();
     });
   }
   public updateScaleAll(scale: number) {
@@ -246,7 +185,9 @@ export default class TabManager {
   public reloadTab(tabId: number) {
     const tab = this.getById(tabId);
 
-    if (tab) {
+    if (tab instanceof Tab) {
+      tab.reload();
+    } else if (tab) {
       tab.view.webContents.reload();
     }
   }

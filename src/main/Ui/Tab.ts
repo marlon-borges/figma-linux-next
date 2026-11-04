@@ -45,12 +45,12 @@ export default class Tab {
   /** Figma's own preview for the file (setTabPreviewData); the card prefers it over `thumbnail`. */
   public previewData: Types.TabPreviewData | null = null;
   /**
-   * Set by TabManager.reapplyUserId when this tab is in the background during
-   * an account switch: the fuid refresh is deferred until the tab is actually
-   * focused (TabManager.applyPendingUserId), instead of reloading every open
-   * tab at once.
+   * The Figma account this tab runs as. A tab keeps the account it was opened
+   * with: switching accounts on the home screen does not touch it, the running
+   * page sends its own X-Figma-User-ID with every request. Taken from the `fuid`
+   * of the URL it loads, then from what the page itself reports (setUser).
    */
-  public pendingUserId?: string;
+  public userId?: string;
 
   private _editorType: Types.EditorType | undefined;
   private _isLibrary = false;
@@ -98,10 +98,44 @@ export default class Tab {
     this.url = url;
     const derived = getEditorTypeFromUrl(url);
     if (derived) this.setEditorType(derived);
+    const fuid = parseURL(url)?.searchParams.get("fuid");
+    if (fuid) this.userId = fuid;
     this.view.webContents.loadURL(url);
   }
   public getUrl() {
     return this.view.webContents.getURL();
+  }
+
+  /**
+   * Reload under this tab's own account. Figma drops `fuid` from a file's URL
+   * once it has loaded, and a bare reload of that URL lets the server pick the
+   * account — after a switch on the home screen, one that may have no access to
+   * this file. So the fuid goes back on before reloading.
+   */
+  public reload() {
+    const wc = this.view.webContents;
+    if (wc.isDestroyed()) return;
+
+    const currentUrl = wc.getURL();
+    const parsedUrl = this.userId && isFigmaRunUrl(currentUrl) ? parseURL(currentUrl) : null;
+    if (!parsedUrl || parsedUrl.searchParams.get("fuid") === this.userId) {
+      wc.reload();
+      return;
+    }
+
+    parsedUrl.searchParams.set("fuid", this.userId);
+    this.loadUrl(parsedUrl.toString());
+
+    // Same family of issue as the "reattached view stays blank" gotcha: a
+    // loadURL() on a visible WebContentsView can land its first frame without
+    // the compositor presenting it on Wayland/Electron 44, until another
+    // visibility toggle. Force that toggle once the page has loaded, if the tab
+    // is still on screen.
+    wc.once("did-finish-load", () => {
+      if (wc.isDestroyed() || !this.view.getVisible()) return;
+      this.view.setVisible(false);
+      this.view.setVisible(true);
+    });
   }
 
   public setBounds(bounds: Rectangle) {
@@ -178,7 +212,7 @@ export default class Tab {
     }
 
     if (this.title === NEW_FILE_TAB_TITLE && isFigmaRunUrl(newUrl)) {
-      app.emit("openUrlInNewTab", newUrl);
+      app.emit("openUrlInNewTab", newUrl, this.userId);
       event.preventDefault();
       return;
     }
@@ -216,7 +250,7 @@ export default class Tab {
     window.close();
 
     if (isFigmaRunUrl(url)) {
-      app.emit("openUrlInNewTab", url);
+      app.emit("openUrlInNewTab", url, this.userId);
       return;
     }
 
@@ -290,7 +324,7 @@ export default class Tab {
     );
 
     if (isFigmaRunUrl(url)) {
-      app.emit("openUrlInNewTab", url);
+      app.emit("openUrlInNewTab", url, this.userId);
       return { action: "deny" as const };
     }
 

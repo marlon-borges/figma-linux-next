@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Each tab keeps the account it was opened with.** Switching accounts on the home screen reloaded
+  every open file under the new account the moment you returned to it, and a file that account
+  couldn't open landed on "request access". Open tabs now stay as they are and only new tabs use
+  the new account, like the official app. A tab's account also survives its reload, a restart and
+  reopening it after closing it, links opened from it inherit it, and a tab still running as the
+  other account no longer pulls the home screen back.
 - **Playing a video on the canvas froze Figma on NVIDIA.** While a video plays Figma re-renders
   the whole scene every frame, and NVIDIA's OpenGL driver spent so much CPU per command that the
   GPU process sat at 100% and the canvas — pan and zoom included — dropped to 2–8 fps (Chrome on

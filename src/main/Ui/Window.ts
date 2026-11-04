@@ -216,7 +216,11 @@ export default class Window {
     return this._userId;
   }
 
-  public setUserId(id: string, sourceWebContentsId?: number) {
+  /**
+   * The home screen's account: what the home tab shows and what new tabs open
+   * as. Open project tabs keep the account they were opened with (Tab.userId).
+   */
+  public setUserId(id: string) {
     const previousId = this._userId;
     this._userId = id;
     this.tabManager.setUserId(id);
@@ -224,12 +228,20 @@ export default class Window {
     // The warm tab bakes the user id into its URL, so an account switch
     // invalidates it. Tear down + reschedule (and schedule on first boot).
     this.warmTabs.onUserIdChanged(previousId, id);
+  }
 
-    // Open project tabs also loaded under the previous account. Re-navigate
-    // them with the new fuid on an actual switch (never on first boot).
-    if (id && previousId && previousId !== id) {
-      this.tabManager.reapplyUserId(id, sourceWebContentsId);
-    }
+  /**
+   * Note the account a project tab (or the warm tab) says it runs as. Returns
+   * false when the sender is neither, so the caller treats it as the home screen.
+   */
+  public recordProjectTabUser(webContentsId: number, userId: string | undefined): boolean {
+    if (this.warmTabs.isWarmTab(webContentsId)) return true;
+
+    const tab = this.tabManager.getAll().get(webContentsId);
+    if (!tab) return false;
+
+    if (userId) tab.userId = userId;
+    return true;
   }
   public sortTabs(tabs: Types.TabFront[]) {
     this.tabManager.sortTabs(tabs);
@@ -267,6 +279,7 @@ export default class Window {
         title: tab.title,
         url: tab.url,
         groupId: tab.groupId,
+        userId: tab.userId,
       });
     }
 
@@ -312,7 +325,7 @@ export default class Window {
     setTimeout(() => {
       tabs.forEach((tab, i) => {
         setTimeout(() => {
-          this.addTab(tab.url, tab.title, tab.groupId);
+          this.addTab(tab.url, tab.title, tab.groupId, tab.userId);
           if (i + 1 === tabs.length) {
             this.setTabFocusByPath(this.state.lastActiveTabPath);
           }
@@ -381,13 +394,14 @@ export default class Window {
     this.setTabFocus(tab.id);
   }
 
-  public openUrl(url: string) {
+  /** `userId`: the account of the tab the link came from; defaults to the home screen's. */
+  public openUrl(url: string, userId?: string) {
     // A link that arrives while the window is still starting (a figma:// click
     // as the app launches) would open its tab under a panel that can't hear
     // about it yet — and the panel's load then puts Home in front of it. Wait;
     // this listener runs after webContentDidFinishLoad, so the file ends on top.
     if (!this.panelLoaded) {
-      this.window.webContents.once("did-finish-load", () => this.openUrl(url));
+      this.window.webContents.once("did-finish-load", () => this.openUrl(url, userId));
       return;
     }
     if (isFileBrowserUrl(url)) {
@@ -406,7 +420,7 @@ export default class Window {
         this.setTabFocus(existing.id);
         return;
       }
-      const tab = this.addTab(httpUrl);
+      const tab = this.addTab(httpUrl, undefined, undefined, userId);
       if (tab) this.setTabFocus(tab.id);
     } else if (/https?:\/\//.test(url)) {
       const existing = this.findTabForUrl(url);
@@ -414,7 +428,7 @@ export default class Window {
         this.setTabFocus(existing.id);
         return;
       }
-      const tab = this.addTab(url);
+      const tab = this.addTab(url, undefined, undefined, userId);
       if (!tab) return;
 
       if (isExportQueueUrl(url)) {
@@ -542,16 +556,17 @@ export default class Window {
 
     this.window.webContents.send("newFileBtnVisible", false);
   }
-  public createFile(args: WebApi.CreateFile) {
+  public createFile(args: WebApi.CreateFile, senderId?: number) {
     const newFileTab = this.tabManager.getByTitle(NEW_FILE_TAB_TITLE);
     const tab = this.addTab(
       args.url,
       undefined,
       newFileTab instanceof Tab ? newFileTab.groupId : undefined,
+      this.tabManager.getAll().get(senderId)?.userId,
     );
     if (!tab) return false;
 
-    tab.loadUrl(args.url);
+    tab.loadUrl(tab.url);
     // newFileTab may be absent (e.g. the file was opened without going through
     // the New-file tab); guard like closeNewFileTab() does — otherwise
     // newFileTab.id throws and the just-created tab is left unfocused.
@@ -794,16 +809,21 @@ export default class Window {
       title: tab instanceof Tab ? tab.title : "",
       url,
       groupId: tab instanceof Tab ? tab.groupId : undefined,
+      userId: tab instanceof Tab ? tab.userId : undefined,
     };
   }
 
-  public addTab(url: string, title?: string, groupId?: string) {
+  /** `userId`: the account the tab belongs to; defaults to the home screen's. */
+  public addTab(url: string, title?: string, groupId?: string, userId?: string) {
     const parsedUrl = parseURL(url);
     if (!parsedUrl) {
       logger.warn(`addTab: invalid URL "${url}", skipping`);
       return null;
     }
-    parsedUrl.searchParams.set("fuid", this._userId);
+    // No account yet (a link clicked as the app starts): leave fuid off, and the
+    // tab learns its account from what the page reports.
+    const accountId = userId || this._userId;
+    if (accountId) parsedUrl.searchParams.set("fuid", accountId);
 
     const tab = this.tabManager.addTab(parsedUrl.toString(), title);
     if (groupId) {
@@ -1214,14 +1234,6 @@ export default class Window {
     this.hideTabGroupPrompt();
     this.swapTo(tab);
 
-    // Catch up a tab whose account-switch refresh was deferred while it was
-    // in the background (see TabManager.reapplyUserId) — a no-op otherwise.
-    // Applied AFTER swapTo, not before: navigating a WebContentsView while
-    // it's still hidden and only then calling setVisible can leave it
-    // unpainted until another visibility toggle on Wayland/Electron 44 (the
-    // "Child views are attached once" gotcha).
-    this.tabManager.applyPendingUserId(tabId);
-
     this.tabManager.focusTab(tabId);
     this.tabManager.setBounds(tabId, bounds);
     this.window.webContents.send("focusTab", tabId);
@@ -1277,7 +1289,8 @@ export default class Window {
       return;
     }
 
-    const tab = this.addTab(url, undefined, targetGroupId);
+    const senderTab = this.tabManager.getAll().get(event?.sender?.id);
+    const tab = this.addTab(url, undefined, targetGroupId, senderTab?.userId);
     if (tab) {
       this.closeNewFileTab();
       this.setTabFocus(tab.id);

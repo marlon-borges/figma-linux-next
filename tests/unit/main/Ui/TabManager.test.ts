@@ -25,6 +25,9 @@ mock.module("electron", () => {
     setBackgroundColor() {}
     setBounds() {}
     setVisible() {}
+    getVisible() {
+      return true;
+    }
   }
 
   return {
@@ -133,122 +136,102 @@ describe("TabManager", () => {
     });
   });
 
-  describe("reapplyUserId", () => {
-    it("refreshes the currently focused tab immediately with the new fuid", () => {
-      const tab = tabManager.addTab("https://test.com", "A");
-      tabManager.focusTab(tab.id);
-      spyOn(tab.view.webContents, "getURL").mockReturnValue(
-        "https://www.figma.com/design/abc/A?fuid=user-1",
-      );
-      const loadUrlSpy = spyOn(tab, "loadUrl");
+  describe("a tab's account", () => {
+    it("takes the account from the fuid of the URL it loads", () => {
+      const tab = tabManager.addTab("https://www.figma.com/design/abc/A?fuid=user-1", "A");
 
-      tabManager.reapplyUserId("user-2");
-
-      expect(loadUrlSpy).toHaveBeenCalledWith("https://www.figma.com/design/abc/A?fuid=user-2");
-      expect(tab.pendingUserId).toBeUndefined();
+      expect(tab.userId).toBe("user-1");
     });
 
-    it("does not reload the tab the switch came from — it already runs as the new account", () => {
-      const tab = tabManager.addTab("https://test.com", "A");
-      tabManager.focusTab(tab.id);
-      const loadUrlSpy = spyOn(tab, "loadUrl");
+    it("keeps the account when a later URL carries no fuid", () => {
+      const tab = tabManager.addTab("https://www.figma.com/design/abc/A?fuid=user-1", "A");
 
-      tabManager.reapplyUserId("user-2", tab.view.webContents.id);
+      tab.loadUrl("https://www.figma.com/design/abc/A");
 
-      expect(loadUrlSpy).not.toHaveBeenCalled();
-      expect(tab.pendingUserId).toBeUndefined();
+      expect(tab.userId).toBe("user-1");
     });
 
-    it("defers background tabs instead of reloading them immediately", () => {
-      const active = tabManager.addTab("https://test.com", "Active");
-      const background = tabManager.addTab("https://test.com", "Background");
-      tabManager.focusTab(active.id);
-      const loadUrlSpy = spyOn(background, "loadUrl");
+    it("ignores an empty fuid", () => {
+      const tab = tabManager.addTab("https://www.figma.com/design/abc/A?fuid=user-1", "A");
 
-      tabManager.reapplyUserId("user-2");
+      tab.loadUrl("https://www.figma.com/?fuid=");
 
-      expect(loadUrlSpy).not.toHaveBeenCalled();
-      expect(background.pendingUserId).toBe("user-2");
-    });
-
-    it("forces a repaint via a visibility toggle once the reload actually lands", () => {
-      const tab = tabManager.addTab("https://test.com", "A");
-      tabManager.focusTab(tab.id);
-      spyOn(tab.view.webContents, "getURL").mockReturnValue("https://www.figma.com/design/abc/A");
-      let finishLoad: (() => void) | undefined;
-      spyOn(tab.view.webContents, "once").mockImplementation(((event: string, cb: () => void) => {
-        if (event === "did-finish-load") finishLoad = cb;
-      }) as any);
-      const setVisibleSpy = spyOn(tab.view, "setVisible");
-
-      tabManager.reapplyUserId("user-2");
-      expect(setVisibleSpy).not.toHaveBeenCalled(); // not yet — waits for the load to land
-      finishLoad?.();
-
-      expect(setVisibleSpy.mock.calls).toEqual([[false], [true]]);
-    });
-
-    it("skips the repaint toggle if the tab is no longer focused by the time it loads", () => {
-      const tab = tabManager.addTab("https://test.com", "A");
-      const other = tabManager.addTab("https://test.com", "Other");
-      tabManager.focusTab(tab.id);
-      spyOn(tab.view.webContents, "getURL").mockReturnValue("https://www.figma.com/design/abc/A");
-      let finishLoad: (() => void) | undefined;
-      spyOn(tab.view.webContents, "once").mockImplementation(((event: string, cb: () => void) => {
-        if (event === "did-finish-load") finishLoad = cb;
-      }) as any);
-      const setVisibleSpy = spyOn(tab.view, "setVisible");
-
-      tabManager.reapplyUserId("user-2");
-      tabManager.focusTab(other.id); // user switched to a different tab before this one finished loading
-      finishLoad?.();
-
-      expect(setVisibleSpy).not.toHaveBeenCalled();
+      expect(tab.userId).toBe("user-1");
     });
   });
 
-  describe("applyPendingUserId", () => {
-    it("applies a deferred fuid update and reloads the tab", () => {
-      const tab = tabManager.addTab("https://test.com", "A");
-      tab.pendingUserId = "user-2";
-      spyOn(tab.view.webContents, "getURL").mockReturnValue("https://www.figma.com/design/abc/A");
-      const loadUrlSpy = spyOn(tab, "loadUrl");
+  describe("reloadTab", () => {
+    const FILE_URL = "https://www.figma.com/design/abc/A";
 
-      tabManager.applyPendingUserId(tab.id);
+    function openAs(userId: string) {
+      const tab = tabManager.addTab(`${FILE_URL}?fuid=${userId}`, "A");
+      return {
+        tab,
+        loadUrl: spyOn(tab, "loadUrl"),
+        reload: spyOn(tab.view.webContents, "reload"),
+      };
+    }
 
-      expect(loadUrlSpy).toHaveBeenCalledWith("https://www.figma.com/design/abc/A?fuid=user-2");
-      expect(tab.pendingUserId).toBeUndefined();
+    it("puts the tab's own fuid back when Figma has dropped it from the URL", () => {
+      const { tab, loadUrl, reload } = openAs("user-1");
+      spyOn(tab.view.webContents, "getURL").mockReturnValue(FILE_URL);
+
+      tabManager.reloadTab(tab.id);
+
+      expect(loadUrl).toHaveBeenCalledWith(`${FILE_URL}?fuid=user-1`);
+      expect(reload).not.toHaveBeenCalled();
     });
 
-    it("is a no-op when there is no pending update", () => {
-      const tab = tabManager.addTab("https://test.com", "A");
-      const loadUrlSpy = spyOn(tab, "loadUrl");
+    it("does a plain reload when the URL already carries the tab's fuid", () => {
+      const { tab, loadUrl, reload } = openAs("user-1");
+      spyOn(tab.view.webContents, "getURL").mockReturnValue(`${FILE_URL}?fuid=user-1`);
 
-      tabManager.applyPendingUserId(tab.id);
+      tabManager.reloadTab(tab.id);
 
-      expect(loadUrlSpy).not.toHaveBeenCalled();
+      expect(reload).toHaveBeenCalled();
+      expect(loadUrl).not.toHaveBeenCalled();
     });
 
-    it("skips destroyed tabs", () => {
-      const tab = tabManager.addTab("https://test.com", "A");
-      tab.pendingUserId = "user-2";
-      spyOn(tab.view.webContents, "isDestroyed").mockReturnValue(true);
-      const loadUrlSpy = spyOn(tab, "loadUrl");
+    it("does a plain reload on a page that is not Figma's, so a failed load can retry", () => {
+      const { tab, loadUrl, reload } = openAs("user-1");
+      spyOn(tab.view.webContents, "getURL").mockReturnValue("chrome-error://chromewebdata/");
 
-      tabManager.applyPendingUserId(tab.id);
+      tabManager.reloadTab(tab.id);
 
-      expect(loadUrlSpy).not.toHaveBeenCalled();
+      expect(reload).toHaveBeenCalled();
+      expect(loadUrl).not.toHaveBeenCalled();
     });
 
-    it("skips tabs whose current URL cannot be parsed", () => {
-      const tab = tabManager.addTab("https://test.com", "A");
-      tab.pendingUserId = "user-2";
-      spyOn(tab.view.webContents, "getURL").mockReturnValue("not-a-url");
-      const loadUrlSpy = spyOn(tab, "loadUrl");
+    it("repaints a visible tab once the page has loaded", () => {
+      const { tab } = openAs("user-1");
+      spyOn(tab.view.webContents, "getURL").mockReturnValue(FILE_URL);
+      let finishLoad: (() => void) | undefined;
+      spyOn(tab.view.webContents, "once").mockImplementation(((event: string, cb: () => void) => {
+        if (event === "did-finish-load") finishLoad = cb;
+      }) as any);
+      const setVisible = spyOn(tab.view, "setVisible");
 
-      tabManager.applyPendingUserId(tab.id);
+      tabManager.reloadTab(tab.id);
+      expect(setVisible).not.toHaveBeenCalled();
+      finishLoad?.();
 
-      expect(loadUrlSpy).not.toHaveBeenCalled();
+      expect(setVisible.mock.calls).toEqual([[false], [true]]);
+    });
+
+    it("does not reveal a tab that went to the background while it loaded", () => {
+      const { tab } = openAs("user-1");
+      spyOn(tab.view.webContents, "getURL").mockReturnValue(FILE_URL);
+      let finishLoad: (() => void) | undefined;
+      spyOn(tab.view.webContents, "once").mockImplementation(((event: string, cb: () => void) => {
+        if (event === "did-finish-load") finishLoad = cb;
+      }) as any);
+      spyOn(tab.view, "getVisible").mockReturnValue(false);
+      const setVisible = spyOn(tab.view, "setVisible");
+
+      tabManager.reloadTab(tab.id);
+      finishLoad?.();
+
+      expect(setVisible).not.toHaveBeenCalled();
     });
   });
 });

@@ -445,6 +445,19 @@ Tab thumbnails: `captureThumbnail()` is fired *before* the outgoing tab is hidde
 has no compositor surface and `capturePage()` rejects with `UnknownVizError`. Do not try to capture
 a background tab on demand; `tab.thumbnail` is the only source the hover card has.
 
+### Every tab owns its account
+There are two notions of "the account": `Window.userId` is the home screen's (what Home shows and
+what new tabs open as), `Tab.userId` is the one a project tab runs as. A running page sends its own
+`X-Figma-User-ID` with every request, so switching on Home must not touch open tabs; reloading them
+under the new account is what used to land them on "request access". Consequences:
+- Every Figma page sends `setUser` as it boots, so `AuthController` lets only the home/community
+  tabs change the current account (`Window.recordProjectTabUser` swallows the rest). Without that,
+  reloading a tab of account A drags Home from B back to A.
+- Figma drops `fuid` from a file's URL once loaded, and a bare `webContents.reload()` lets the server
+  pick the account. Reload project tabs with `Tab.reload()`, which puts it back.
+- Anything that recreates a tab passes the account on: `SavedTab.userId` (restart, reopen closed)
+  and the `userId` argument of `openUrlInNewTab` (links opened from a tab).
+
 ### openFile must close the New File tab
 `Window.openFile()` must call `closeNewFileTab()` after opening the file tab. Without this, the New File tab stays visible as a leftover. `createFile()` already does this — keep them consistent.
 
