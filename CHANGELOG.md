@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.22.3] - 2026-11-04
+
+Each tab now stays on the account it was opened with, and video on the canvas no longer brings
+NVIDIA systems to a crawl.
+
 ### Fixed
 
 - **Each tab keeps the account it was opened with.** Switching accounts on the home screen reloaded
