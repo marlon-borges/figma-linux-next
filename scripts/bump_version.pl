@@ -7,12 +7,38 @@ if ($version eq "") {
   exit 1;
 }
 
-my $prevVersion = `git tag --sort=version:refname | tail -n1 | tr -d 'v' | tr -d '\n'`;
+if ($version !~ /^\d+\.\d+\.\d+(-[0-9A-Za-z.]+)?$/) {
+  print "Not a version: $version\n";
+  exit 1;
+}
+
+my $versionField = qr/^(\s*"version":\s*")([^"]+)(")/m;
+
+sub read_file {
+  my ($path) = @_;
+  open(my $in, "<", $path) or die "Cannot read $path: $!\n";
+  local $/;
+  return scalar <$in>;
+}
+
+# The manifest's own "version" field, and nothing else: a dependency can carry
+# the same number. The previous version comes from package.json because the
+# latest git tag is not reliable: fetching the original project brings its tags.
+sub set_version {
+  my ($path) = @_;
+  my $text = read_file($path);
+  $text =~ s/$versionField/$1$version$3/ or die "No version field in $path\n";
+  open(my $out, ">", $path) or die "Cannot write $path: $!\n";
+  print $out $text;
+  close($out) or die "Cannot write $path: $!\n";
+}
+
+my ($prevVersion) = read_file("./package.json") =~ /$versionField/ ? $2 : "";
 
 printf("Bump %s to %s version.\n", $prevVersion, $version);
 
-system("sed -i \"s/$prevVersion/$version/\" ./package.json");
-system("sed -i \"s/$prevVersion/$version/\" ./src/package.json");
+set_version("./package.json");
+set_version("./src/package.json");
 
 # The Flatpak manifest names the tag it builds. Left stale it still builds fine —
 # it just packages the previous release — so it is rewritten here, not by hand.
