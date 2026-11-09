@@ -428,7 +428,7 @@ and `applyChromiumSwitches(settings, nvidia, gpu)` take both facts; `nvidia` com
 ## Important Gotchas
 
 ### Electron version is exact (no caret) — every bump needs a manual OAuth test
-`package.json` lists an exact version, currently `"electron": "45.1.0"` (Chromium 156), bumped 2026-11-08 from 44.5.1 together with upstream v0.24.0, whose vendored Flatpak sources it reuses as is. Upstream verified OAuth first login on 45.1.0 (2026-10-30, clean profile); this fork must re-check it before tagging the release that ships it. Last verified here: 44.5.1 (2026-10-01): `__Host-figma.authn` lands.
+`package.json` lists an exact version, currently `"electron": "45.1.0"` (Chromium 156), bumped 2026-11-08 from 44.5.1 together with upstream v0.24.0, whose vendored Flatpak sources it reuses as is. OAuth first login re-verified here on 45.1.0 (2026-11-08, clean profile via `XDG_CONFIG_HOME`, bundled binary from `node_modules`, Firefox): `__Host-figma.authn` lands.
 
 History: 43.3.0 shipped a StatusNotifierItem regression (tray icons invisible on GNOME/AppIndicator, Cinnamon, XFCE; electron#52674, fixed in 43.4.1). 44.0 rebuilt the `clipboard` module: every method is async, payloads are `ClipboardItem` → `Blob` by MIME type, `readImage/writeImage/readBuffer/writeBuffer` are gone, and the module no longer exists in renderers — which is why `ClipboardController` now owns both read and write and the tab preload only forwards `getClipboardData`/`setClipboardData`.
 
