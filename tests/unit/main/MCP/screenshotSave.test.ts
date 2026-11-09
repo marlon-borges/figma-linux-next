@@ -298,3 +298,60 @@ describe("get_screenshot: savePath cannot be aimed at a non-PNG file", () => {
     expect(meta.saveError).toBeUndefined();
   });
 });
+
+describe("Figma AI image tools: savePath gets the same guard", () => {
+  const generated = { base64: PNG_BASE64, ms: 1, model: "m" };
+  const vectorized = { svg: '<svg xmlns="http://www.w3.org/2000/svg"/>', ms: 1, model: "m" };
+
+  test("generate_image will not write over a dotfile", async () => {
+    const target = path.join(tmpDir, ".bashrc");
+    fs.writeFileSync(target, "export PATH=...");
+    const { handlers } = makeHandlers({ execResult: generated });
+
+    const meta = metaOf(
+      await handlers.toolFigmaAiGenerateImage({ prompt: "a leaf", savePath: target }),
+    );
+
+    expect(meta.savedTo).toBeUndefined();
+    expect(meta.saveError).toContain(".png");
+    expect(fs.readFileSync(target, "utf8")).toBe("export PATH=...");
+  });
+
+  test("generate_image will not write through a symlink", async () => {
+    const victim = path.join(tmpDir, "victim.txt");
+    fs.writeFileSync(victim, "keep me");
+    const link = path.join(tmpDir, "leaf.png");
+    fs.symlinkSync(victim, link);
+    const { handlers } = makeHandlers({ execResult: generated });
+
+    const meta = metaOf(
+      await handlers.toolFigmaAiGenerateImage({ prompt: "a leaf", savePath: link }),
+    );
+
+    expect(meta.savedTo).toBeUndefined();
+    expect(fs.readFileSync(victim, "utf8")).toBe("keep me");
+  });
+
+  test("without savePath the image lands under the export directory", async () => {
+    const { handlers } = makeHandlers({ execResult: generated });
+
+    const meta = metaOf(await handlers.toolFigmaAiGenerateImage({ prompt: "a leaf" }));
+
+    expect(meta.savedTo.startsWith(path.join(saveBaseDir, "figma-ai"))).toBe(true);
+    expect(fs.existsSync(meta.savedTo)).toBe(true);
+  });
+
+  test("edit_image (vectorize) writes an .svg, may replace an SVG, never another file", async () => {
+    const svg = path.join(tmpDir, "icon.svg");
+    fs.writeFileSync(svg, '<?xml version="1.0"?><svg/>');
+    const notes = path.join(tmpDir, "notes.svg");
+    fs.writeFileSync(notes, "precious text");
+    const { handlers } = makeHandlers({ execResult: vectorized });
+    const edit = (savePath: string) =>
+      handlers.toolFigmaAiEditImage({ nodeId: "1:2", operation: "vectorize", savePath });
+
+    expect(metaOf(await edit(svg)).savedTo).toBe(svg);
+    expect(metaOf(await edit(notes)).savedTo).toBeUndefined();
+    expect(fs.readFileSync(notes, "utf8")).toBe("precious text");
+  });
+});

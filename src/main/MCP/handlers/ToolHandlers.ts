@@ -69,7 +69,7 @@ import {
 import type { AssetEntry, CodeConnectEntry, FigmaViewProvider, Logger } from "../types";
 import { parseMermaid } from "../utils/mermaid";
 import { normalizeNodeId } from "../utils/nodeId";
-import { assertSafePngTarget } from "../utils/savePath";
+import { assertSafeImageTarget, assertSafePngTarget } from "../utils/savePath";
 import { safeStringify } from "../utils/serialize";
 import { appendLogs, toolError, toolResult } from "../utils/toolResponse";
 
@@ -955,6 +955,9 @@ export class ToolHandlers {
           : undefined,
     };
     try {
+      // Same guard as get_screenshot: a caller (or a prompt-injected agent) must not aim
+      // the write at ~/.bashrc or an autostart entry.
+      await assertSafeImageTarget(absPath, isSvg ? "svg" : "png");
       await fs.promises.mkdir(path.dirname(absPath), { recursive: true });
       await fs.promises.writeFile(absPath, isSvg ? out.svg : Buffer.from(out.base64, "base64"));
       meta.savedTo = absPath;

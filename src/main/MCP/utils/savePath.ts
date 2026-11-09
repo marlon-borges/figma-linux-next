@@ -1,5 +1,6 @@
 /**
- * savePath.ts — guards for get_screenshot's `savePath`.
+ * savePath.ts — guards for every MCP tool that writes a file at a caller's `savePath`
+ * (get_screenshot, figma_ai_generate_image, figma_ai_edit_image).
  *
  * An absolute savePath is a feature (an agent saves straight into its own
  * project), so the destination is not confined to one directory. What is
@@ -20,8 +21,23 @@ const PNG_MAGIC = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
  * about its target.
  */
 export async function assertSafePngTarget(absPath: string): Promise<void> {
-  if (path.extname(absPath).toLowerCase() !== ".png") {
-    throw new Error("savePath must end in .png");
+  return assertSafeImageTarget(absPath, "png");
+}
+
+/** Leading bytes that identify each kind; an SVG may open with an XML prolog. */
+const looksLike: Record<"png" | "svg", (head: Buffer) => boolean> = {
+  png: (head) => head.subarray(0, PNG_MAGIC.length).equals(PNG_MAGIC),
+  svg: (head) => /^(\uFEFF)?\s*<(\?xml|svg|!--)/i.test(head.toString("utf8")),
+};
+
+/**
+ * assertSafePngTarget for either image kind a tool writes: the extension must
+ * match, symlinks and non-regular files are refused, and an existing file is
+ * only replaced when it already is that kind of image.
+ */
+export async function assertSafeImageTarget(absPath: string, kind: "png" | "svg"): Promise<void> {
+  if (path.extname(absPath).toLowerCase() !== `.${kind}`) {
+    throw new Error(`savePath must end in .${kind}`);
   }
 
   let stat: fs.Stats;
@@ -37,10 +53,12 @@ export async function assertSafePngTarget(absPath: string): Promise<void> {
 
   const handle = await fs.promises.open(absPath, "r");
   try {
-    const head = Buffer.alloc(PNG_MAGIC.length);
+    const head = Buffer.alloc(64);
     const { bytesRead } = await handle.read(head, 0, head.length, 0);
-    if (bytesRead !== PNG_MAGIC.length || !head.equals(PNG_MAGIC)) {
-      throw new Error("refusing to overwrite an existing file that is not a PNG");
+    if (!looksLike[kind](head.subarray(0, bytesRead))) {
+      throw new Error(
+        `refusing to overwrite an existing file that is not a${kind === "svg" ? "n SVG" : " PNG"}`,
+      );
     }
   } finally {
     await handle.close();
