@@ -125,9 +125,15 @@ test.describe("Each tab keeps its account", () => {
 
     await handle.app.evaluate(({ app }, id) => app.emit("reloadTab", id), tab.id);
 
+    // Tab ids are logical (lazy restore), not webContents ids: find the page by its file.
     await expect
       .poll(() =>
-        handle.app.evaluate(({ webContents }, id) => webContents.fromId(id)?.getURL(), tab.id),
+        handle.app.evaluate(({ webContents }) =>
+          webContents
+            .getAllWebContents()
+            .map((wc) => wc.getURL())
+            .find((url) => url.includes("AAA111aaa")),
+        ),
       )
       .toContain("fuid=account-a");
 
