@@ -7,6 +7,91 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.24.0] - 2026-11-08
+
+Brings in upstream 0.23.0 to 0.24.0: an MCP server that speaks Figma's remote MCP and answers in a
+fraction of the characters, files that reopen where you left them, adjustable trackpad speeds with
+experimental momentum, and Electron 45 (Chromium 156). Issue and PR numbers below refer to
+[arximus88/figma-linux-next](https://github.com/arximus88/figma-linux-next).
+
+### Added
+
+- **Figma MCP speaks the remote server's language.** The built-in server takes the same tool calls
+  as Figma's remote MCP, so prompts and skills written for it work here. `use_figma` runs Plugin API
+  `code` as a single undo step (a script that throws is undone); every file tool takes `fileKey` (a
+  key or a pasted figma.com link) and runs in the tab showing that file
+  ([#67](https://github.com/arximus88/figma-linux-next/issues/67)); new `whoami`,
+  `download_assets`, `upload_assets`, `get_comments` and `get_versions`; `create_new_file` creates a
+  real file.
+- **Leaner MCP answers.** `get_design_context` returns markup with CSS instead of raw JSON —
+  variables by name, text styles and components defined once, icons as one `<svg/>` (95k characters
+  became 10k on a 54-layer screen). `get_variable_defs` resolves aliases to the value each token
+  renders with, `search_design_system` finds components in every library you can reach, and the new
+  `list_libraries`, `get_library_styles`, `get_library_updates` and `get_code_connect` cover the
+  design system.
+- **Figma AI tools (experimental).** Behind their own switch, Settings → Integrations → Figma AI
+  tools, off by default because they spend your Figma AI credits: hand a task to Figma's built-in
+  agent and see what it changed, generate and edit images, check your credits. They use Figma's
+  internal web APIs, so a Figma update can break them; the tools then say which part went missing.
+- **Settings list every MCP tool** with the description an assistant reads.
+- **Trackpad pan and pinch-zoom speed** ([#47](https://github.com/arximus88/figma-linux-next/issues/47)).
+  Settings → General → Trackpad has a speed for each gesture, from 0.25× to 4×; at 1× nothing
+  changes and a mouse wheel is never affected.
+- **Trackpad momentum (experimental)** ([#47](https://github.com/arximus88/figma-linux-next/issues/47)).
+  Let go mid-swipe or mid-pinch and the canvas keeps moving, slowing down as on macOS. Off by
+  default, with a slider for how far it glides. Idea from [figmix](https://gitlab.com/Valo27/figmix).
+- **Lazy session restore** (opt-in, Settings → Tabs & windows). Only the most recently used tabs
+  load at startup (1–10, default 3); the rest load when you select them, under the account each tab
+  was saved with. Thanks to [@jangoux](https://github.com/jangoux)
+  ([#77](https://github.com/arximus88/figma-linux-next/pull/77)).
+
+### Fixed
+
+- **Files reopen on the page and at the spot you left**
+  ([#72](https://github.com/arximus88/figma-linux-next/issues/72)). The saved session now keeps the
+  address Figma updates as you move around, instead of the one the file was opened with.
+- **Local fonts on NixOS and in the Flatpak**
+  ([#83](https://github.com/arximus88/figma-linux-next/issues/83)). Any font the system's
+  fontconfig lists is served, not only those under a fixed list of folders; other paths are still
+  refused.
+- **Exports keep subfolders from frame names.** A frame named `Icons / home` exports to
+  `Icons/home.png` again; names that would leave the chosen folder are refused and listed in the
+  export report ([#85](https://github.com/arximus88/figma-linux-next/pull/85)).
+- **MCP clients that wait for headers no longer time out** on `GET /mcp`
+  ([#84](https://github.com/arximus88/figma-linux-next/pull/84)), and the "Plugin API not available"
+  error says when a tab just needs a reload.
+- **Failed browser hand-offs are logged** ([#41](https://github.com/arximus88/figma-linux-next/issues/41)).
+  When a link or a plugin's "Log in" could not open in the browser, the log now says why.
+
+### Security
+
+- **Figma AI image tools could overwrite any file.** `figma_ai_generate_image` and
+  `figma_ai_edit_image` wrote to whatever `savePath` they were given. They now get the guard
+  `get_screenshot` has had since 0.22.2: the extension must be `.png` (or `.svg` for a vectorized
+  image), symlinks are refused, and an existing file is only replaced if it already is that kind of
+  image.
+- **The MCP server no longer sends `Access-Control-Allow-Origin: *`.** Loopback origins (the MCP
+  Inspector) get their own origin echoed back; other origins were already refused.
+
+### Changed
+
+- **Electron 45.1.0 (Chromium 156)**, up from 44.5.1. Brings the Linux fixes from the 44.x line:
+  paste no longer hangs on X11 until a restart, and a D-Bus call on a disconnected bus no longer
+  crashes the app. File watching for local plugin development moves to chokidar 6.
+- **WebGPU shaders can stay on native Wayland with NVIDIA**
+  ([#74](https://github.com/arximus88/figma-linux-next/pull/74)). On systems where every GPU is
+  NVIDIA with driver 535.183.01 or newer, Chromium already qualifies the WebGPU interop, so turning
+  shaders on no longer moves the app to XWayland — as long as the Vulkan renderer is off. With the
+  Vulkan renderer on (the default on NVIDIA), the app runs under XWayland as before. Hybrid systems,
+  AMD and older drivers keep the XWayland fallback. Thanks to
+  [@richard-grosjean](https://github.com/richard-grosjean).
+- **Opening links from your browser is off by default on new installs.** It shares
+  `127.0.0.1:44950` with [figma-agent-linux](https://github.com/neetly/figma-agent-linux), and
+  whichever starts first takes the port — taking it from figma-agent-linux silently cost browser
+  users their local fonts. Turn it on in Settings → Integrations → Open links from your browser.
+- Build tooling: Biome 2.6.6, Playwright 1.65.0, Svelte 5.57.3, Vite 8.3.6, electron-builder
+  26.18.0, vite-plugin-electron 1.2.0. `vite.config` now loads under Vite's native config loader.
+
 ## [0.22.3] - 2026-11-04
 
 Each tab now stays on the account it was opened with, and video on the canvas no longer brings

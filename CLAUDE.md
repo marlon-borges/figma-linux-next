@@ -365,6 +365,11 @@ toggle relaunches the packaged app under XWayland (`shouldRelaunchUnderX11`, `sr
 `Utils/Main/nativeWebGpu.ts` reads `/proc/driver/nvidia/version` before Chromium starts and skips
 the relaunch only when all DRM GPUs are NVIDIA and the driver is allowlisted — measured 2026-10-11 on an RTX 3080 with Electron 44:
 native Wayland, no flags, "WebGPU interop: Hardware accelerated". Intel is not detected yet.
+The fork's Vulkan renderer (`app.enableVulkanRenderer`, default on, NVIDIA proprietary driver
+only) needs XWayland whatever that allowlist says, so on NVIDIA the native-Wayland shader path only
+applies with the Vulkan renderer turned off. `shouldRelaunchUnderX11(settings, env, nvidia, gpu)`
+and `applyChromiumSwitches(settings, nvidia, gpu)` take both facts; `nvidia` comes from
+`hasNvidiaProprietaryDriver()`, `gpu` from `readGpuFacts()`.
 
 ### Window Frame Styles
 
@@ -423,7 +428,7 @@ native Wayland, no flags, "WebGPU interop: Hardware accelerated". Intel is not d
 ## Important Gotchas
 
 ### Electron version is exact (no caret) — every bump needs a manual OAuth test
-`package.json` lists an exact version, currently `"electron": "44.5.1"` (Chromium 152, Node 24), bumped 2026-10-01 from 44.2.0. OAuth first login re-verified on 44.5.1 (2026-10-01, clean profile, bundled binary): `__Host-figma.authn` lands.
+`package.json` lists an exact version, currently `"electron": "45.1.0"` (Chromium 156), bumped 2026-11-08 from 44.5.1 together with upstream v0.24.0, whose vendored Flatpak sources it reuses as is. Upstream verified OAuth first login on 45.1.0 (2026-10-30, clean profile); this fork must re-check it before tagging the release that ships it. Last verified here: 44.5.1 (2026-10-01): `__Host-figma.authn` lands.
 
 History: 43.3.0 shipped a StatusNotifierItem regression (tray icons invisible on GNOME/AppIndicator, Cinnamon, XFCE; electron#52674, fixed in 43.4.1). 44.0 rebuilt the `clipboard` module: every method is async, payloads are `ClipboardItem` → `Blob` by MIME type, `readImage/writeImage/readBuffer/writeBuffer` are gone, and the module no longer exists in renderers — which is why `ClipboardController` now owns both read and write and the tab preload only forwards `getClipboardData`/`setClipboardData`.
 
@@ -481,6 +486,16 @@ under the new account is what used to land them on "request access". Consequence
   pick the account. Reload project tabs with `Tab.reload()`, which puts it back.
 - Anything that recreates a tab passes the account on: `SavedTab.userId` (restart, reopen closed)
   and the `userId` argument of `openUrlInNewTab` (links opened from a tab).
+
+### Tab ids are logical, not webContents ids
+Since lazy restore (`app.lazyRestoreTabs`), a saved tab can sit in the strip as a `DiscardedTab`
+shell with no view, and gets a new webContents on first focus — so `Tab.id` comes from
+`allocateLogicalTabId()` and no longer equals `view.webContents.id`. Anything starting from
+`event.sender.id` resolves the tab with `TabManager.getByWebContentsId` (or
+`Window.getTabByWebContentsId`); `getAll().get(event.sender.id)` silently finds nothing.
+`WarmTabManager.isWarmTab` takes the webContents id too. A shell carries its account
+(`DiscardedTab.userId`, from `SavedTab.userId` or Home's for older profiles) and `reviveTab` loads it
+with that `fuid`.
 
 ### openFile must close the New File tab
 `Window.openFile()` must call `closeNewFileTab()` after opening the file tab. Without this, the New File tab stays visible as a leftover. `createFile()` already does this — keep them consistent.

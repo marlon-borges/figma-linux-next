@@ -24,7 +24,7 @@ Not affiliated with or endorsed by Figma, Inc.
   <a href="https://github.com/marlon-borges/figma-linux-next/commits"><img alt="Last commit" src="https://img.shields.io/github/last-commit/marlon-borges/figma-linux-next?style=flat-square"></a>
 </p>
 <p>
-  <img alt="Electron" src="https://img.shields.io/badge/Electron-44-47848F?style=flat-square&logo=electron&logoColor=white">
+  <img alt="Electron" src="https://img.shields.io/badge/Electron-45-47848F?style=flat-square&logo=electron&logoColor=white">
   <img alt="Svelte" src="https://img.shields.io/badge/Svelte-5-FF3E00?style=flat-square&logo=svelte&logoColor=white">
   <img alt="Vite" src="https://img.shields.io/badge/Vite-8-646CFF?style=flat-square&logo=vite&logoColor=white">
   <img alt="Bun" src="https://img.shields.io/badge/Bun-000000?style=flat-square&logo=bun&logoColor=white">
@@ -41,12 +41,17 @@ Not affiliated with or endorsed by Figma, Inc.
 - **Shader, Halftone & Noise effects** — Figma's new WebGPU canvas effects render, matching the official app (opt-in, Experimental). On NVIDIA-only systems with driver 535.183.01 or newer they keep native Wayland. Other systems use the X11/XWayland workaround where supported, trading native Wayland features (fractional scaling, per-monitor DPI) for shaders while enabled.
 - **Local plugin development** — import a plugin from its `manifest.json` and iterate locally with hot-reload.
 - **Figma links open in the app** — the app answers the local-helper check figma.com makes from a browser, so **Open in desktop app** and the **Open links in desktop app** preference work on Linux like they do on Mac and Windows. See [Opening links from your browser](#opening-links-from-your-browser).
-- **Built-in MCP server for AI assistants** — a [Model Context Protocol](https://modelcontextprotocol.io) server (default port 3845) lets AI tools like Claude Code read **and** write your open design: scene-graph metadata, design context, variables/styles, screenshots, plus create/edit nodes and Mermaid→FigJam diagrams. Read-only by default; write tools, the port, and an optional Chrome DevTools control plane are toggled in Settings. See [AI integration (MCP)](#ai-integration-mcp).
-- **Latest Chromium engine** — Electron 44 / Chromium 152, so the canvas, WebGL and color handling track the current web app.
+- **Built-in MCP server for AI assistants** — a live [Model Context Protocol](https://modelcontextprotocol.io) server (`127.0.0.1:3845`) that speaks the same tool calls as Figma's remote MCP, so Claude Code, Cursor and other clients can read and edit your open design without a plugin. Read-only by default; write tools, Figma AI tools and a Chrome DevTools control plane are separate switches in Settings. See [AI integration (MCP)](#ai-integration-mcp).
+- **Latest Chromium engine** — Electron 45 / Chromium 156, so the canvas, WebGL and color handling track the current web app.
 - **Up-to-date Google Fonts** — Google Sans, Google Sans Flex, Google Sans Code and other recent additions are available.
 - **Runs on both Wayland and X11** — native Wayland on GNOME, KDE Plasma, Sway, Hyprland, with a clean X11 fallback. Tested on Asahi Linux (Apple Silicon), Niri, and openSUSE.
 - **Native window frame styles** — GNOME (Adwaita), KDE Plasma (Breeze) and Legacy Windows (Figma's own Windows chrome) frames, picked automatically from your desktop environment (Plasma → Breeze, GNOME → Adwaita, anything else → Legacy) with a manual override in Settings (macOS TBD). The frame follows Figma's Light/Dark/System theme, the minimize/maximize buttons can be hidden for a stock-GNOME look, and the new-tab `+` can sit after the last tab (as in Figma's own desktop app) instead of the left corner. Resting the pointer on a tab shows a card with its title, Figma's thumbnail of the file and when it was last edited (off switch in Settings).
 - **Instant new-file tab** — pre-loaded in the background after login, opens with no delay.
+- **Trackpad tuned for Linux** — pan and pinch-zoom speeds are adjustable (Figma tunes both for a Mac
+  trackpad), and an experimental momentum mode keeps the canvas gliding after you lift your fingers.
+- **Sessions that come back as you left them** — files reopen on the page and viewport you were on,
+  each under the account it was opened with; optional lazy restore loads only your most recent tabs
+  at startup and the rest when you click them.
 - **System tray** — opt-in in Settings: Figma stays in the tray when the last window closes; "Show Figma" brings it back (restoring a minimised window), with New Window, Settings and Quit alongside. Native on KDE Plasma, needs the AppIndicator extension on GNOME.
 - **Config isolation** — uses `~/.config/figma-linux-next`, no conflicts with legacy installations.
 
@@ -71,21 +76,29 @@ one Figma's page looks for and cannot change. A `figma://` link still opens the 
 
 figma-linux-next ships a built-in [Model Context Protocol](https://modelcontextprotocol.io) server so
 assistants like Claude Code can work with your **live** design — no plugin to install, no cloud
-round-trip. Everything binds to `127.0.0.1` and is configured in **Settings → General → MCP integrations**.
+round-trip. Everything binds to `127.0.0.1` and is configured in **Settings → Integrations**.
 
-- **Data plane — Figma MCP** (HTTP, default `127.0.0.1:3845`, on by default). Reads file info,
-  scene-graph metadata, design context, variables & styles, Code Connect maps, and node screenshots;
-  helper tools `figma_find` / `figma_tree` locate and outline nodes cheaply, and it can emit
-  design-system rules for your codebase. With **write tools** enabled (opt-in) it also creates and edits
-  frames, text, rectangles and variables, and turns Mermaid into FigJam diagrams. The port and the
-  write-tools gate are both configurable.
+- **Context that fits your agent.** `get_design_context` answers in markup with CSS: tokens by name
+  (`var(--color-text, #14191f)`), text styles and component docs defined once, repeated instances
+  written out once. A 54-layer screen takes 10k characters where raw JSON took 95k.
+- **Speaks Figma's remote MCP.** `use_figma` runs Plugin API code as one undo step, every file tool
+  takes a `fileKey` or a pasted link and runs in that file's tab, plus `get_metadata`,
+  `get_screenshot`, `get_variable_defs`, `search_design_system`, `download_assets` /
+  `upload_assets`, `get_comments` and `get_versions`.
+- **Your whole design system in reach.** Search every team and community library you can use, list
+  libraries and their published styles, see library updates the file has not accepted, read Code
+  Connect snippets.
+- **Figma's AI, from your own assistant** (experimental, off by default, spends your AI credits).
+  Claude or Cursor can hand a task to Figma's built-in agent and check what it changed, generate and
+  edit images (saved to disk and placed in the file), and check your credit balance.
 - **Control plane — Chrome DevTools (CDP)** (opt-in, needs a restart). Exposes the app window over
-  `--remote-debugging-port` so a CDP client (e.g. [chrome-devtools-mcp](https://github.com/ChromeDevTools/chrome-devtools-mcp))
-  can drive the UI — switch tabs, click, type, screenshot the real window. Paired with the data plane,
-  an assistant can navigate to a file and then read or edit it.
+  `--remote-debugging-port` so a CDP client (e.g.
+  [chrome-devtools-mcp](https://github.com/ChromeDevTools/chrome-devtools-mcp)) can drive the UI —
+  switch tabs, click, type, screenshot the real window.
 
-Read access is on out of the box; anything that mutates your files or exposes window control is
-off-by-default and opt-in.
+Reading is on out of the box. Write tools, Figma AI tools and window control are separate opt-in
+switches, and Settings lists every tool with the description your assistant reads. Web pages open in
+your browser cannot reach the server: requests carrying a non-loopback `Origin` are refused.
 
 The data plane reads files through Figma's own Plugin API (`window.figma`), which Figma exposes only
 when you can **edit** the file: not with a Dev or View seat, not in files shared with you as
@@ -96,7 +109,7 @@ which works with view access.
 
 ## Tech Stack
 
-- **Electron 44** (Chromium 152)
+- **Electron 45** (Chromium 156)
 - **Svelte 5** with runes
 - **Vite 8**
 - **Bun**
