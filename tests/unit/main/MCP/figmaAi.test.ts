@@ -298,51 +298,66 @@ describe("figma_ai_generate_image", () => {
 });
 
 describe("list_libraries", () => {
-  it("lists libraries by name, enabled ones first, without their long keys", async () => {
+  function libraryPage(teamId: string | null, parentOrgId: string | null = null) {
     const view = (name: string) => ({ _name: name });
     const views = { a: view("LibraryFileSubscriptions"), b: view("SubscribedLibrariesForFile") };
     const lg = Object.assign(
-      async (v: any): Promise<any> =>
-        v._name === "LibraryFileSubscriptions"
-          ? {
-              file: {
-                libraryFileSubscriptionOverrides: [{ libraryKey: "lk-ds", isSubscribed: true }],
-              },
-            }
-          : { file: { libraryTeamSubscriptions: [] } },
+      async (v: any, args: any): Promise<any> => {
+        if (v._name === "LibraryFileSubscriptions") {
+          return {
+            file: {
+              libraryFileSubscriptionOverrides: [{ libraryKey: "lk-ds", isSubscribed: true }],
+            },
+          };
+        }
+        // What Figma answers for a file in Drafts (checked live on 2026-11-12).
+        if (args.teamId == null) {
+          throw new Error(
+            "View 'SubscribedLibrariesForFile': argument error: 'teamId' 'must not be null'",
+          );
+        }
+        return { file: { libraryTeamSubscriptions: [] } };
+      },
       { toString: () => "function(e,t,n){return subscribe(e,t,{settleTimeoutMs:1})}" },
     );
-    const store = { getState: () => ({ openFile: { key: "FILE", name: "App", teamId: "1" } }) };
+    const store = {
+      getState: () => ({ openFile: { key: "FILE", name: "App", teamId, parentOrgId } }),
+    };
     const window: any = {
       rspackChunk_figma_web_bundler: bundler({
         "1": {
           source: "/api/design_systems/libraries_by_library_keys",
           exports: {
             Z: {
-              getLibrariesV2: async () => ({
+              // In an organization Figma answers an empty list unless asked for the org's
+              // libraries (checked live on 2026-11-12).
+              getLibrariesV2: async (args: any) => ({
                 data: {
-                  meta: [
-                    {
-                      library_key: "lk-x".repeat(30),
-                      library_name: "Icons",
-                      library_file_key: "F2",
-                      team_name: "T",
-                      num_components: 9,
-                      num_styles: 0,
-                      num_variables: 0,
-                      num_variable_collections: 0,
-                    },
-                    {
-                      library_key: "lk-ds",
-                      library_name: "DS",
-                      library_file_key: "F1",
-                      team_name: "T",
-                      num_components: 58,
-                      num_styles: 15,
-                      num_variables: 170,
-                      num_variable_collections: 5,
-                    },
-                  ],
+                  meta:
+                    parentOrgId && args.orgId !== parentOrgId
+                      ? []
+                      : [
+                          {
+                            library_key: "lk-x".repeat(30),
+                            library_name: "Icons",
+                            library_file_key: "F2",
+                            team_name: "T",
+                            num_components: 9,
+                            num_styles: 0,
+                            num_variables: 0,
+                            num_variable_collections: 0,
+                          },
+                          {
+                            library_key: "lk-ds",
+                            library_name: "DS",
+                            library_file_key: "F1",
+                            team_name: "T",
+                            num_components: 58,
+                            num_styles: 15,
+                            num_variables: 170,
+                            num_variable_collections: 5,
+                          },
+                        ],
                 },
               }),
             },
@@ -353,11 +368,27 @@ describe("list_libraries", () => {
         "4": { source: "settleTimeoutMs", exports: { Ek: lg } },
       }),
     };
-    const { text } = await run(LIST_LIBRARIES_SCRIPT, window);
-    expect(text.split("\n").slice(1)).toEqual([
-      "- [on] DS · 58 components, 15 styles, 170 variables in 5 collections · T · file F1",
-      "- [  ] Icons · 9 components, 0 styles, 0 variables · T · file F2",
-    ]);
+    return window;
+  }
+  const expected = [
+    "- [on] DS · 58 components, 15 styles, 170 variables in 5 collections · T · file F1",
+    "- [  ] Icons · 9 components, 0 styles, 0 variables · T · file F2",
+  ];
+
+  it("lists libraries by name, enabled ones first, without their long keys", async () => {
+    const { text } = await run(LIST_LIBRARIES_SCRIPT, libraryPage("1"));
+    expect(text.split("\n").slice(1)).toEqual(expected);
     expect(text).not.toContain("lk-");
+  });
+
+  it("lists the organization's libraries for a file in an org", async () => {
+    const { text } = await run(LIST_LIBRARIES_SCRIPT, libraryPage("1", "ORG"));
+    expect(text.split("\n").slice(1)).toEqual(expected);
+  });
+
+  it("lists them for a file in Drafts, which has no team", async () => {
+    const { text, error } = await run(LIST_LIBRARIES_SCRIPT, libraryPage(null, "ORG"));
+    expect(error).toBeUndefined();
+    expect(text.split("\n").slice(1)).toEqual(expected);
   });
 });

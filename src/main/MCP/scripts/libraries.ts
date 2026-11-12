@@ -63,12 +63,16 @@ const LIB_PREAMBLE = `
       const c = libs();
       const st = c.store.getState();
       const file = st.openFile;
-      const all = (await c.ds.getLibrariesV2({})).data.meta || [];
+      // In an organization the endpoint answers an empty list unless asked for that org's
+      // libraries (checked live on 2026-11-12: 0 without orgId, 11 with it).
+      const all = (await c.ds.getLibrariesV2(file.parentOrgId ? { orgId: file.parentOrgId } : {})).data.meta || [];
       const subs = await c.lg(view('LibraryFileSubscriptions'), { fileKey: file.key });
       const overrides = (subs && subs.file && subs.file.libraryFileSubscriptionOverrides) || [];
       const on = {}, off = {};
       for (const o of overrides) (o.isSubscribed ? on : off)[o.libraryKey] = true;
-      const team = await c.lg(view('SubscribedLibrariesForFile'), { fileKey: file.key, group: null, orgId: file.parentOrgId || null, teamId: file.teamId, workspaceId: null });
+      // A file in Drafts has no team, and the view refuses a null teamId ("'teamId' 'must not
+      // be null'"), so there are no team-wide subscriptions to read: only the file's own.
+      const team = file.teamId ? await c.lg(view('SubscribedLibrariesForFile'), { fileKey: file.key, group: null, orgId: file.parentOrgId || null, teamId: file.teamId, workspaceId: null }) : null;
       const teamSubs = (team && team.file && team.file.libraryTeamSubscriptions) || [];
       for (const s of teamSubs) {
         const k = (s.communityLibrary && s.communityLibrary.hubFile && s.communityLibrary.hubFile.libraryKey) || (s.library && s.library.libraryKey);
