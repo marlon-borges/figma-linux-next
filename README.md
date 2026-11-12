@@ -80,11 +80,16 @@ round-trip. Everything binds to `127.0.0.1` and is configured in **Settings → 
 
 - **Context that fits your agent.** `get_design_context` answers in markup with CSS: tokens by name
   (`var(--color-text, #14191f)`), text styles and component docs defined once, repeated instances
-  written out once. A 54-layer screen takes 10k characters where raw JSON took 95k.
+  written out once. A 54-layer screen takes 10k characters where raw JSON took 95k. Pass
+  `clientFrameworks: "react"` and it answers with a React + Tailwind component instead, like
+  Figma's remote server.
 - **Speaks Figma's remote MCP.** `use_figma` runs Plugin API code as one undo step, every file tool
   takes a `fileKey` or a pasted link and runs in that file's tab, plus `get_metadata`,
-  `get_screenshot`, `get_variable_defs`, `search_design_system`, `download_assets` /
+  `get_screenshot`, `get_motion_context`, `get_variable_defs`, `search_design_system`, `download_assets` /
   `upload_assets`, `get_comments` and `get_versions`.
+- **Stays out of your way.** A file named by `fileKey` does not have to be the tab in front, or
+  even loaded: tools read it, screenshot it and edit it in the background, and never raise the
+  window or switch your tab.
 - **Your whole design system in reach.** Search every team and community library you can use, list
   libraries and their published styles, see library updates the file has not accepted, read Code
   Connect snippets.
