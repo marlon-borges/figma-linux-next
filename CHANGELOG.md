@@ -7,6 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`get_design_context` reads Figma's 3D transforms.** 3D transforms (open beta since
+  2026-11-12) render and edit in the app as they do in a browser. Until now the MCP answer
+  dropped them, so an agent saw a flat layout. It now writes them the way Dev Mode does:
+  `perspective` and `transform-style:preserve-3d` on the scene, and on each layer
+  `transform:translateZ() rotateX() rotateY() rotateZ()` after any 2D rotation, plus
+  `transform-origin` and `backface-visibility:hidden` when they're set. One deliberate
+  difference: an effect that is toggled off is left out, because the canvas doesn't draw it,
+  even though Dev Mode still prints it.
+
+### Fixed
+
+- **`list_libraries` and `search_design_system` find your organization's libraries.** In an
+  organization, Figma's library endpoint returns an empty list unless it's asked for that
+  org's libraries. On org accounts this meant "No libraries are available to you" and searches
+  without any team library. Both tools now ask for the file's organization.
+- **`list_libraries` works in files in Drafts.** A draft has no team, and the call for team-wide
+  subscriptions failed with "'teamId' 'must not be null'". Drafts now list their libraries.
+
+### Changed
+
+- **Electron 45.3.1** (Chromium 156.0.8078.96, up from .49): Chromium security fixes, a fix
+  for renderer crashes on unbounded `webRequest` redirect loops, and certificates from
+  eMudhra's revoked intermediates are no longer trusted. Also Biome 2.6.7, Vite 8.3.8 and
+  @tsconfig/svelte 5.0.9. The Flatpak sources were regenerated, which also moves its
+  build-time `undici` to 7.30.2.
+
 ## [0.24.0] - 2026-11-08
 
 Brings in upstream 0.23.0 to 0.24.0: an MCP server that speaks Figma's remote MCP and answers in a

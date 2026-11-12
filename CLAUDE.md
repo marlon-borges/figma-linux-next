@@ -428,7 +428,7 @@ and `applyChromiumSwitches(settings, nvidia, gpu)` take both facts; `nvidia` com
 ## Important Gotchas
 
 ### Electron version is exact (no caret) — every bump needs a manual OAuth test
-`package.json` lists an exact version, currently `"electron": "45.1.0"` (Chromium 156), bumped 2026-11-08 from 44.5.1 together with upstream v0.24.0, whose vendored Flatpak sources it reuses as is. OAuth first login re-verified here on 45.1.0 (2026-11-08, clean profile via `XDG_CONFIG_HOME`, bundled binary from `node_modules`, Firefox): `__Host-figma.authn` lands.
+`package.json` lists an exact version, currently `"electron": "45.3.1"` (Chromium 156.0.8078.96), bumped 2026-11-12 from 45.1.0. The Flatpak sources were regenerated locally with `flatpak-node-generator` (`pipx install "git+https://github.com/flatpak/flatpak-builder-tools.git#subdirectory=node"`). The last verified OAuth first login was on 45.1.0 (2026-11-08, clean profile via `XDG_CONFIG_HOME`, bundled binary from `node_modules`, Firefox): `__Host-figma.authn` lands. **45.3.1 still needs that check before a release.**
 
 History: 43.3.0 shipped a StatusNotifierItem regression (tray icons invisible on GNOME/AppIndicator, Cinnamon, XFCE; electron#52674, fixed in 43.4.1). 44.0 rebuilt the `clipboard` module: every method is async, payloads are `ClipboardItem` → `Blob` by MIME type, `readImage/writeImage/readBuffer/writeBuffer` are gone, and the module no longer exists in renderers — which is why `ClipboardController` now owns both read and write and the tab preload only forwards `getClipboardData`/`setClipboardData`.
 
