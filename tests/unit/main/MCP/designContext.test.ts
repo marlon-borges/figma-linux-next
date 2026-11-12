@@ -231,3 +231,96 @@ describe("get_design_context", () => {
     expect(error).toContain("needs a layer, not a page");
   });
 });
+
+describe("get_design_context — 3D transforms", () => {
+  // Shapes and expected CSS read from Figma's own Plugin API and getCSSAsync() on 2026-11-12.
+  const t3 = (extra: Record<string, number | boolean>) => ({
+    type: "FIXED_ORDER",
+    translateZ: 0,
+    rotateX: 0,
+    rotateY: 0,
+    rotateZ: 0,
+    backfaceVisible: true,
+    visible: true,
+    ...extra,
+  });
+  const center = { x: { unit: "PERCENT", value: 50 }, y: { unit: "PERCENT", value: 50 } };
+
+  function stage(
+    children: any[],
+    scene3d: any = { perspective: 900, preserve3d: true, visible: true },
+  ) {
+    const root = base("1:1", "Stage", "FRAME", { width: 800, height: 500, scene3d, children });
+    root.parent = { id: "0:1", name: "Page", type: "PAGE", parent: null };
+    const figma: any = {
+      root: { name: "3D" },
+      currentPage: { selection: [] },
+      getNodeByIdAsync: async (id: string) => (id === "1:1" ? root : null),
+      getStyleByIdAsync: async (): Promise<null> => null,
+      variables: { getVariableByIdAsync: async (): Promise<null> => null },
+    };
+    return figma;
+  }
+  const line = (text: string, id: string) =>
+    text.split("\n").find((l: string) => l.includes(`id="${id}"`)) ?? "";
+  const card = (id: string, extra: Record<string, unknown>) =>
+    base(id, id, "RECTANGLE", { transformOrigin: center, ...extra });
+
+  it("writes the scene's perspective and the children's 3D transforms like Dev Mode", async () => {
+    const { text } = await run(
+      stage([
+        card("2:1", { transform3d: t3({ rotateY: 45.00000125 }) }),
+        card("2:2", { transform3d: t3({ translateZ: 80, rotateX: 34.9999998, rotateZ: 12 }) }),
+      ]),
+      "1:1",
+    );
+    expect(line(text, "1:1")).toContain("perspective:900px;transform-style:preserve-3d");
+    expect(line(text, "2:1")).toContain("transform:rotateY(45deg)");
+    expect(line(text, "2:2")).toContain("transform:translateZ(80px) rotateX(35deg) rotateZ(12deg)");
+    expect(text).not.toContain("transform-origin");
+    expect(text).not.toContain("backface");
+  });
+
+  it("puts the 2D rotation first and adds origin and hidden backface when set", async () => {
+    const { text } = await run(
+      stage([
+        card("2:1", { rotation: 20, transform3d: t3({ rotateX: 30 }) }),
+        card("2:2", {
+          transform3d: t3({ rotateY: 30, backfaceVisible: false }),
+          transformOrigin: { x: { unit: "PIXELS", value: 0 }, y: { unit: "PERCENT", value: 100 } },
+        }),
+      ]),
+      "1:1",
+    );
+    expect(line(text, "2:1")).toContain("transform:rotate(-20deg) rotateX(30deg)");
+    expect(line(text, "2:2")).toContain(
+      "transform-origin:0px 100%;backface-visibility:hidden;transform:rotateY(30deg)",
+    );
+  });
+
+  it("leaves out a 3D effect that is toggled off, which the canvas does not draw", async () => {
+    const { text } = await run(
+      stage(
+        [
+          card("2:1", { transform3d: t3({ rotateX: 40, visible: false }) }),
+          card("2:2", {
+            transform3d: { type: "NONE" },
+            transformOrigin: { x: { unit: "PERCENT", value: 0 }, y: { unit: "PERCENT", value: 0 } },
+          }),
+        ],
+        { perspective: 300, preserve3d: true, visible: false },
+      ),
+      "1:1",
+    );
+    for (const noise of ["transform", "perspective", "rotate"]) expect(text).not.toContain(noise);
+  });
+
+  it("writes a perspective without preserve-3d when the scene flattens its children", async () => {
+    const { text } = await run(
+      stage([], { perspective: 500, preserve3d: false, visible: true }),
+      "1:1",
+    );
+    expect(line(text, "1:1")).toContain("perspective:500px");
+    expect(text).not.toContain("preserve-3d");
+  });
+});

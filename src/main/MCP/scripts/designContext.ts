@@ -247,7 +247,35 @@ export const DESIGN_CONTEXT_SCRIPT = (nodeId: string | null, depth: number) => `
       for (const [prop, css] of [['minWidth', 'min-width'], ['maxWidth', 'max-width'], ['minHeight', 'min-height'], ['maxHeight', 'max-height']]) {
         if (isNum(node[prop])) st.push(css + ':' + (await num(node, prop, node[prop])));
       }
-      if (isNum(node.rotation) && Math.abs(node.rotation) > 0.01) st.push('transform:rotate(' + r(-node.rotation) + 'deg)');
+      // ── transforms ──
+      // 3D transforms (open beta 2026-11-12): written the way Dev Mode's CSS writes them —
+      // translateZ first, then rotateX/Y/Z (FIXED_ORDER), zero terms left out, after the 2D
+      // rotate. One difference: an effect toggled off (visible:false) is not drawn on the
+      // canvas, so it emits nothing here, where Dev Mode still prints it.
+      const tf = [];
+      if (isNum(node.rotation) && Math.abs(node.rotation) > 0.01) tf.push('rotate(' + r(-node.rotation) + 'deg)');
+      const t3 = node.transform3d;
+      if (t3 && t3.type === 'FIXED_ORDER' && t3.visible !== false) {
+        const n3 = tf.length;
+        if (isNum(t3.translateZ) && Math.abs(t3.translateZ) > 0.01) tf.push('translateZ(' + px(t3.translateZ) + ')');
+        for (const k of ['rotateX', 'rotateY', 'rotateZ']) {
+          if (isNum(t3[k]) && Math.abs(t3[k]) > 0.01) tf.push(k + '(' + r(t3[k]) + 'deg)');
+        }
+        if (tf.length > n3) {
+          const o = node.transformOrigin;
+          const oc = function (a) { return a.unit === 'PIXELS' ? px(a.value) : r(a.value) + '%'; };
+          if (o && o.x && o.y && !(o.x.unit === 'PERCENT' && o.x.value === 50 && o.y.unit === 'PERCENT' && o.y.value === 50)) {
+            st.push('transform-origin:' + oc(o.x) + ' ' + oc(o.y));
+          }
+          if (t3.backfaceVisible === false) st.push('backface-visibility:hidden');
+        }
+      }
+      if (tf.length) st.push('transform:' + tf.join(' '));
+      const s3 = node.scene3d;
+      if (s3 && s3.visible !== false) {
+        if (isNum(s3.perspective) && s3.perspective > 0) st.push('perspective:' + px(s3.perspective));
+        if (s3.preserve3d) st.push('transform-style:preserve-3d');
+      }
 
       // ── icons and illustrations ──
       const vg = vectorGroup(node);
