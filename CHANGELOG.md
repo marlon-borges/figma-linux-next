@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+Brings in upstream 0.24.1 and 0.25.0: MCP tools work in background and unloaded tabs without
+raising the window, even with the screen locked; `get_design_context` can answer in React +
+Tailwind; a new tool reads a layer's animation; and variable fonts such as Cantarell get their
+axes back. Issue numbers below refer to
+[arximus88/figma-linux-next](https://github.com/arximus88/figma-linux-next).
+
 ### Added
 
 - **`get_design_context` reads Figma's 3D transforms.** 3D transforms (open beta since
@@ -17,6 +23,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `transform-origin` and `backface-visibility:hidden` when they're set. One deliberate
   difference: an effect that is toggled off is left out, because the canvas doesn't draw it,
   even though Dev Mode still prints it.
+- **MCP tools stay in the background** ([#90](https://github.com/arximus88/figma-linux-next/issues/90)).
+  A tool that names a file by `fileKey` used to switch to that tab and raise the window, in the
+  middle of whatever you were doing. Tools now work on the tab where it is. A tab that was
+  restored lazily and never opened is loaded in place, and a file whose editor is still starting
+  is waited for (up to 20 seconds) instead of failing with "Figma Plugin API not available".
+- **`get_design_context` in React + Tailwind** ([#89](https://github.com/arximus88/figma-linux-next/issues/89)).
+  Ask with `format: "react"`, or let the client say it works in React, Next.js, Remix or Gatsby
+  (`clientFrameworks`), and the answer is a component like the one Figma's remote server returns:
+  one JSX element per layer with Tailwind classes, icons and images as URLs served by the app,
+  `data-node-id` on every element, and a screenshot of the node to compare against. Skills
+  written for Figma's server, such as `figma-design-to-code`, work with it as they are. 3D
+  transforms carry over as Tailwind arbitrary properties. The default answer is still the
+  compact markup.
+- **`get_motion_context`** ([#89](https://github.com/arximus88/figma-linux-next/issues/89)).
+  Reads the animation on a layer: keyframes per property with times, values and easings as CSS
+  timing functions, the animation styles applied to it, and the timeline's duration.
+- **`use_figma` runs the code Figma teaches agents.** Figma's `figma-use` skill writes code with
+  helpers its remote server provides: `figma.createAutoLayout`, `figma.io.write`,
+  `node.set` / `query` / `screenshot` / `tree` / `placeholder`, `page.findPlacement`. Here they
+  failed with "is not a function" and cost the agent a retry each run. They now work the same
+  way, and images from `screenshot()` come back to the agent as images.
+- **MCP tools say what they do to your file.** Every tool carries the standard MCP annotations,
+  like Figma's remote server: reading tools are marked read-only, `use_figma`, `figma_text`, the
+  Figma agent and image editing are marked destructive, and the Figma AI tools that call a
+  generative model are marked open-world. Clients show these next to each tool (Claude Code's
+  `/mcp` list) and can use them to decide what needs your approval.
+- **`search_design_system` finds UI kits.** Simple Design System, iOS and Material components
+  show up next to your team libraries, and `includeLibraryKeys` takes a library name as well as
+  a key.
 
 ### Fixed
 
@@ -26,6 +61,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   without any team library. Both tools now ask for the file's organization.
 - **`list_libraries` works in files in Drafts.** A draft has no team, and the call for team-wide
   subscriptions failed with "'teamId' 'must not be null'". Drafts now list their libraries.
+- **Files in a background tab no longer time out.** A tab behind another one gets no animation
+  frames, and Figma waits for one before exporting an image, importing a library component or
+  listing libraries, so those calls hung for a minute and failed. MCP work now keeps the tab
+  awake while it runs.
+- **Exports work with the screen locked or off.** GNOME stops drawing every window then, and
+  Figma waits for a drawn frame before it exports, so a screenshot asked for by an agent
+  overnight ran into the 60-second limit. The app now asks for a frame itself while an MCP call
+  is waiting.
+- **Variable fonts that lost their axes.** SF Pro, New York, Cantarell and some other variable
+  fonts were listed without weight or width axes, because the font reader threw on them.
+  Updated to fontkit 3, which reads them, and loaded so that an older system Electron (AUR)
+  still starts if it cannot.
+- **`generate_diagram` respects the editing switch.** It adds shapes to the open FigJam file but
+  was available with "Allow editing tools" off. It is now behind that switch, like `use_figma`.
+- **`get_screenshot` with `savePath` no longer sends the image twice.** The file is written and
+  only its path comes back; if the write fails, the image comes back inline. The PNG-only guard
+  on `savePath` stays.
+- **Long Figma agent prompts no longer lose their result.** MCP clients give up on a call after
+  about 30 seconds, while a design prompt runs for several. `figma_agent_prompt` now returns the
+  thread id after 20 seconds while the agent keeps working, names the thread as soon as it
+  exists, and `figma_agent_read` shows what each exchange cost.
+- **Code layers from Figma's agent read back as one exchange.** When Make finishes a code layer,
+  Figma wakes the agent with a hidden prompt of its own; `figma_agent_read` showed it as a second
+  prompt nobody wrote. It now folds into the prompt that started it, says "code layer still
+  building" until Make reports back, and lists the files each patch changed.
+- **Figma AI tools no longer hang while a file is opening.** They check the editor first (3 s at
+  most) and say the file is still opening, instead of waiting behind the load until the client
+  gives up.
+- **Less noise in the log.** `setMergingStatus`, which Figma sends during branch merges, no
+  longer logs as unhandled.
 
 ### Changed
 
@@ -34,6 +99,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   eMudhra's revoked intermediates are no longer trusted. Also Biome 2.6.7, Vite 8.3.8 and
   @tsconfig/svelte 5.0.9. The Flatpak sources were regenerated, which also moves its
   build-time `undici` to 7.30.2.
+- **fontkit 3.0.0**; the Flatpak sources were regenerated for it.
+- **Unused code removed**: 26 shared renderer components and a handful of constants and helpers
+  nothing imported.
 
 ## [0.24.0] - 2026-11-08
 

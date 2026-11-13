@@ -19,8 +19,9 @@ bun run cln            # Clean dist/
 
 # Release prep (run on staging, NOT on dev)
 perl scripts/bump_version.pl X.Y.Z    # bump version + commit + tag on staging
-# NOTE: bump_version.pl takes the previous version from the latest git tag (not package.json)
-# and seds it into package.json and src/package.json, then runs
+# NOTE: bump_version.pl takes the previous version from package.json (not the latest git tag:
+# fetching upstream brings the original project's tags) and seds the new one into package.json
+# and src/package.json, then runs
 # `scripts/sync_flatpak_release.py --version X.Y.Z` (Flatpak manifest tag, flatpak/package.json,
 # metainfo <release>). It aborts before committing if the Flatpak step fails, and commits only
 # those five files. Afterwards check:
@@ -97,7 +98,7 @@ staging  ←── all features, fixes, and daily work
 ## Release Flow (step by step)
 
 > **A release runs only on the owner's explicit, separate order.** Finishing a batch of work is
-> not a reason to bump, push `staging`, open the PR or push a tag. Before any of it: `bun run
+> not a reason to bump, push `staging`, merge into `dev` or push a tag. Before any of it: `bun run
 > build && bun run test:e2e` and a check in the live app.
 
 > **Rule:** tag push triggers the release. The tag must be pushed **after** staging is merged into dev — so release only goes out when dev is already updated.
