@@ -217,6 +217,29 @@ describe("buildReactCode", () => {
     new Bun.Transpiler({ loader: "tsx" }).transformSync(two);
     expect(pascalCase("—", "Component")).toBe("Component");
   });
+
+  // The fork's 3D transforms (676187c) reach the React form through Tailwind's
+  // arbitrary properties; markup as get_design_context writes it for a 3D scene.
+  test("3D transforms survive as arbitrary properties", () => {
+    const scene = buildReactCode({
+      nodes: parseMarkup(
+        '<frame id="1:1" name="Stage" style="width:800px;height:500px;perspective:900px;transform-style:preserve-3d">\n' +
+          '  <rectangle id="2:1" name="A" style="width:100px;height:100px;transform-origin:0px 100%;backface-visibility:hidden;transform:rotate(-20deg) rotateX(30deg)"/>\n' +
+          '  <rectangle id="2:2" name="B" style="width:100px;height:100px;transform:translateZ(80px) rotateX(35deg) rotateZ(12deg)"/>\n' +
+          "</frame>\n",
+      ),
+      textStyleCss: {},
+      svgUrls: {},
+      imageUrls: {},
+    }).code;
+    expect(scene).toContain("[perspective:900px]");
+    expect(scene).toContain("[transform-style:preserve-3d]");
+    expect(scene).toContain("[transform-origin:0px_100%]");
+    expect(scene).toContain("[backface-visibility:hidden]");
+    expect(scene).toContain("[transform:rotate(-20deg)_rotateX(30deg)]");
+    expect(scene).toContain("[transform:translateZ(80px)_rotateX(35deg)_rotateZ(12deg)]");
+    new Bun.Transpiler({ loader: "tsx" }).transformSync(scene);
+  });
 });
 
 describe("get_design_context picks its form", () => {

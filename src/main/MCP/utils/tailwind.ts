@@ -180,19 +180,21 @@ export function tailwindFor(style: string): TailwindResult {
         classes.push(withHint("stroke", value, "length"));
         break;
       case "transform": {
-        const rotate = /^rotate\((.+)\)$/.exec(value);
+        // A lone rotate() only: with a 3D transform after it ("rotate(-20deg) rotateX(30deg)")
+        // a greedy match would swallow both into one broken class.
+        const rotate = /^rotate\(([^()]+)\)$/.exec(value);
         classes.push(
           rotate ? `rotate-[${arbitrary(rotate[1])}]` : `[transform:${arbitrary(value)}]`,
         );
         break;
       }
       case "filter": {
-        const blur = /^blur\((.+)\)$/.exec(value);
+        const blur = /^blur\(([^()]+)\)$/.exec(value);
         classes.push(blur ? `blur-[${arbitrary(blur[1])}]` : `[filter:${arbitrary(value)}]`);
         break;
       }
       case "backdrop-filter": {
-        const blur = /^blur\((.+)\)$/.exec(value);
+        const blur = /^blur\(([^()]+)\)$/.exec(value);
         classes.push(
           blur ? `backdrop-blur-[${arbitrary(blur[1])}]` : `[backdrop-filter:${arbitrary(value)}]`,
         );
