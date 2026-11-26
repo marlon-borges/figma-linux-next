@@ -39,6 +39,10 @@ import {
   isExportQueueUrl,
   parseURL,
   getTabDedupKey,
+  getNodeIdFromUrl,
+  keepTabParams,
+  isFigmaWebUrl,
+  withFuid,
 } from "Utils/Common";
 import { panelUrlDev, panelUrlProd, resolveFrameStyle, toggleDetachedDevTools } from "Utils/Main";
 import { computeTabPreviewBounds, displayUrl, type PreviewAnchor } from "Utils/Main/tabPreview";
@@ -52,6 +56,8 @@ import { SettingsTab } from "./SettingsTab";
 const EXPORT_QUEUE_ATTACH_DELAY_MS = 400;
 /** Attach the export-queue tab regardless, so a failed load can't leave it hidden. */
 const EXPORT_QUEUE_ATTACH_TIMEOUT_MS = 8000;
+/** How long Figma gets to show a linked node before `handleUrl` is tried instead. */
+const NODE_NAVIGATION_STEP_MS = 1500;
 
 export default class Window {
   private window: BrowserWindow;
@@ -65,6 +71,8 @@ export default class Window {
   private tabPreview: TabPreviewView | null = null;
   // "New Group with This Tab" popover; created on first use.
   private tabGroupPrompt: TabGroupPromptView | null = null;
+  // Latest node link per tab: a newer one cancels an older one's follow-up (focusTabAtLink).
+  private linkRuns = new WeakMap<Tab, number>();
   // Tab group metadata for this window, keyed by group id. Membership itself
   // lives on each live Tab (tab.groupId) — this map only holds label/color/
   // collapsed/order. Persisted as `tabGroups` in Types.WindowState.
@@ -516,19 +524,26 @@ export default class Window {
       const parsed = parseURL(url);
       this.handleUrl(`${parsed.pathname}${parsed.search}`);
       this.setFocusToMainTab();
-    } else if (/figma:\/\//.test(url)) {
+    } else if (/^figma:\/\//.test(url)) {
       const httpUrl = url.replace(/figma:\//, HOMEPAGE);
       const existing = this.findTabForUrl(httpUrl);
       if (existing) {
-        this.setTabFocus(existing.id);
+        this.focusTabAtLink(existing, httpUrl);
         return;
       }
       const tab = this.addTab(httpUrl, undefined, undefined, userId);
       if (tab) this.setTabFocus(tab.id);
     } else if (/https?:\/\//.test(url)) {
+      // Reached from the clipboard shortcut and the command line, with any text
+      // in it. A tab runs the desktop preload with contextIsolation off, so only
+      // figma.com may load in one. Anything else is dropped, not opened anywhere.
+      if (!isFigmaWebUrl(url)) {
+        logger.warn("[openUrl] not a figma.com URL, not opening it in a tab:", url);
+        return;
+      }
       const existing = this.findTabForUrl(url);
       if (existing) {
-        this.setTabFocus(existing.id);
+        this.focusTabAtLink(existing, url);
         return;
       }
       const tab = this.addTab(url, undefined, undefined, userId);
@@ -541,6 +556,55 @@ export default class Window {
       }
     }
   }
+
+  /**
+   * A link to a file that is already open focuses its tab — and must also take
+   * the tab to the frame the link names. Focusing alone left the file where it
+   * was, so a link only worked while its file was closed.
+   *
+   * Figma's page moves within the open file on its own desktop messages, which
+   * keeps the editor loaded: `handleUrlParams` applies a link's query to the
+   * current view. If after NODE_NAVIGATION_STEP_MS the page's URL still shows
+   * the node it showed before, `handleUrl` routes the whole path once more.
+   *
+   * Never a reload: it costs a large file its load time and its undo history.
+   * The URL follows the selection, so a click on another layer, or a second
+   * link, used to read as "nothing moved" and reloaded the tab back to the
+   * first node. A newer link to the same tab cancels the older one's check.
+   *
+   * The tab's mode (`m=dev`) and account (`fuid`) carry over when the link
+   * names none. A discarded tab is revived at the link.
+   */
+  private focusTabAtLink(existing: Tab | DiscardedTab, url: string) {
+    const nodeId = getNodeIdFromUrl(url);
+    if (nodeId && "discarded" in existing) existing.url = keepTabParams(url, existing.url);
+    this.setTabFocus(existing.id);
+    if (!nodeId || !(existing instanceof Tab)) return;
+
+    const wc = existing.view.webContents;
+    if (wc.isDestroyed()) return;
+    const target = parseURL(keepTabParams(url, wc.getURL()));
+    if (!target) return;
+
+    const run = (this.linkRuns.get(existing) ?? 0) + 1;
+    this.linkRuns.set(existing, run);
+    const before = getNodeIdFromUrl(wc.getURL());
+
+    wc.send("handleUrlParams", target.search, target.hash);
+    setTimeout(() => {
+      if (wc.isDestroyed() || this.linkRuns.get(existing) !== run) return;
+      const now = getNodeIdFromUrl(wc.getURL());
+      if (now === nodeId) {
+        logger.debug("[openUrl] handleUrlParams moved open tab to node", nodeId);
+      } else if (now === before) {
+        logger.debug("[openUrl] handleUrlParams did not move the tab, trying handleUrl", nodeId);
+        wc.send("handleUrl", target.pathname, target.search, target.hash);
+      }
+      // Anything else: the page moved somewhere on its own (the user selected
+      // another layer). Leave it there.
+    }, NODE_NAVIGATION_STEP_MS);
+  }
+
   public focus() {
     // Reached from the tray as well, where the window may be minimised or
     // hidden — focus() alone does not un-minimise on any platform.
@@ -650,7 +714,7 @@ export default class Window {
     } else {
       // Fallback: warm tab not ready yet, create normally
       const tab = this.addTab(
-        `${NEW_PROJECT_TAB_URL}?fuid=${this._userId}`,
+        withFuid(NEW_PROJECT_TAB_URL, this._userId),
         NEW_FILE_TAB_TITLE,
         groupId,
       );
@@ -1483,7 +1547,7 @@ export default class Window {
   public openCommunity(args: WebApi.OpenCommunity) {
     const alreadyOpen = this.tabManager.hasOpenedCommunityTab;
     const bounds = this.calcBoundsForTabView();
-    const url = `${HOMEPAGE}${args.path}?fuid=${args.userId}`;
+    const url = withFuid(`${HOMEPAGE}${args.path}`, args.userId);
 
     if (!alreadyOpen) {
       this.tabManager.addCommunityTab();

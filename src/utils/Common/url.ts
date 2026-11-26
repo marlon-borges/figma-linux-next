@@ -1,5 +1,18 @@
 import { PROTOCOL, HOMEPAGE } from "Const";
 
+/**
+ * `url` with Figma's account selector (`fuid`) set to `userId`, or removed
+ * when there is no user yet (first start, signed out). A template like
+ * `?fuid=${id}` sent the literal "fuid=undefined" to figma.com.
+ */
+export const withFuid = (url: string, userId?: string | null): string => {
+  const parsed = parseURL(url);
+  if (!parsed) return url;
+  if (userId) parsed.searchParams.set("fuid", String(userId));
+  else parsed.searchParams.delete("fuid");
+  return parsed.toString();
+};
+
 // Modernized URL handling logic based on figma-linux-fork analysis
 
 export const parseURL = (url: string): URL | undefined => {
@@ -14,6 +27,17 @@ export const parseURL = (url: string): URL | undefined => {
  *  string (figma.com.evil.com, notfigma.com). */
 export const isFigmaHost = (hostname: string): boolean =>
   hostname === "figma.com" || hostname.endsWith(".figma.com");
+
+/** An http(s) URL on figma.com: the only web pages a tab may be opened at.
+ *  A tab runs the desktop preload with contextIsolation off. */
+export const isFigmaWebUrl = (url: string): boolean => {
+  const parsed = parseURL(url);
+  return (
+    !!parsed &&
+    (parsed.protocol === "https:" || parsed.protocol === "http:") &&
+    isFigmaHost(parsed.hostname)
+  );
+};
 
 export const isFigmaRunUrl = (url: string): boolean => {
   const parsed = parseURL(url);
@@ -183,4 +207,33 @@ export const getTabDedupKey = (url: string): string | null => {
   if (type === "proto") return `proto:${key}`;
   if (type === "export") return `export:${key}`;
   return `doc:${key}`;
+};
+
+/** The `node-id` a link points at, in Figma's URL form (`1-23`). Links carry
+ *  either `1-23` or the API form `1:23`; both map to the same node. */
+export const getNodeIdFromUrl = (url: string): string | null => {
+  const nodeId = parseURL(url)?.searchParams.get("node-id");
+  return nodeId ? nodeId.replace(/:/g, "-") : null;
+};
+
+/** Query parameters a tab keeps when a link to its file names none of its own:
+ *  the editor mode (`m=dev` — Figma opens a link without `m` in Design mode)
+ *  and the account (`fuid` — without it figma.com picks the default account,
+ *  so a second account's file answered "no access"). */
+const TAB_PARAMS = ["m", "fuid"] as const;
+
+/** `link` with the tab's own `m` and `fuid` (from `current`) where it names none. */
+export const keepTabParams = (link: string, current: string): string => {
+  const target = parseURL(link);
+  const page = parseURL(current);
+  if (!target || !page) return link;
+  let changed = false;
+  for (const name of TAB_PARAMS) {
+    const value = page.searchParams.get(name);
+    if (value && !target.searchParams.has(name)) {
+      target.searchParams.set(name, value);
+      changed = true;
+    }
+  }
+  return changed ? target.toString() : link;
 };

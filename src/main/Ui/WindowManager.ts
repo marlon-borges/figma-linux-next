@@ -547,7 +547,8 @@ export default class WindowManager {
   }
   private async openFileUrlClipboard() {
     const window = this.windows.get(this.lastFocusedwindowId);
-    const uri = await clipboard.readText();
+    // A copied link often carries a trailing newline or leading spaces.
+    const uri = (await clipboard.readText()).trim();
 
     window?.openUrl(uri);
   }
